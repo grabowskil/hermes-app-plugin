@@ -85,5 +85,8 @@ What a user should know before installing (Hermes catalog rule 13):
 ## Tests
 
 ```sh
-~/.hermes/hermes-agent/venv/bin/python -m pytest plugin/tests
+~/.hermes/hermes-agent/venv/bin/python -m pytest -q tests
 ```
+
+From any directory: the tests find the plugin through `tests/conftest.py`, and `tests/pytest.ini` keeps
+pytest from collecting the plugin package itself.

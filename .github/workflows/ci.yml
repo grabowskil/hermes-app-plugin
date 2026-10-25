@@ -12,10 +12,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install Hermes Agent (the version this plugin targets)
+      - name: Hermes Agent sources (the release this plugin targets) and the modules the plugin imports
         run: |
           git clone --quiet --depth 1 --branch v0.22.2 https://github.com/NousResearch/hermes-agent "$RUNNER_TEMP/hermes-agent"
-          python -m pip install --quiet --upgrade pip
-          python -m pip install --quiet -e "$RUNNER_TEMP/hermes-agent" pytest segno
+          python -m pip install --quiet aiohttp ruamel.yaml pyyaml segno pytest httpx python-dotenv pydantic
       - name: Run tests
         run: python -m pytest -q tests
+        env:
+          PYTHONPATH: ${{ runner.temp }}/hermes-agent
