@@ -12,7 +12,8 @@ catalog points at. It is a read-only mirror, pushed automatically from a private
 repository on every merge; pull requests here are overwritten by the next mirror push, so report
 problems as issues instead. The companion iOS app, **Petasos: Agent Command**, is distributed
 through the App Store only. Its source is not published and it cannot be built from this
-repository; the plugin here is everything the app needs on the gateway side.
+repository; the plugin here is everything the app needs on the gateway side. Companion app: Petasos,
+privacy policy at https://grabowskil.github.io/petasos-site/privacy.html.
 
 Install from this repository and restart the gateway:
 
