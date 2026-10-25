@@ -1,0 +1,27 @@
+manifest_version: 2
+name: hermes_app
+label: Hermes App
+kind: platform
+version: 2.0.0
+description: >
+  Server side of the Hermes iOS app. Stores gateway and cron notices, serves them with
+  upload, search and todo routes under /app/v1 on the API server's port, and prints a
+  pairing QR code (hermes app pair). Receives no inbound messages and makes no network calls.
+author: Lennart Grabowski
+license: MIT
+requires_hermes: ">=0.22.2"
+python_dependencies:
+  - "segno>=1.6,<2"
+provides_hooks:
+  - post_tool_call
+optional_env:
+  - name: HERMES_APP_HOME_CHANNEL
+    description: "Home channel id for gateway notices and cron delivery (any non-empty value, e.g. app)"
+    prompt: "Home channel"
+    password: false
+capabilities:
+  provides_tools: []
+  provides_hooks:
+    - post_tool_call
+  provides_middleware: []
+  requires_env: []
