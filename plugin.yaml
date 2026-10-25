@@ -9,6 +9,7 @@ description: >
   pairing QR code (hermes app pair). Receives no inbound messages and makes no network calls.
 author: Lennart Grabowski
 license: MIT
+homepage: https://github.com/grabowskil/hermes-app-plugin
 requires_hermes: ">=0.22.2"
 python_dependencies:
   - "segno>=1.6,<2"

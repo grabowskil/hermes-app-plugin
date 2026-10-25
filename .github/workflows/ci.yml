@@ -1,0 +1,21 @@
+# Tests for the hermes_app plugin against the Hermes release it targets.
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Hermes Agent (the version this plugin targets)
+        run: |
+          git clone --quiet --depth 1 --branch v0.22.2 https://github.com/NousResearch/hermes-agent "$RUNNER_TEMP/hermes-agent"
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet -e "$RUNNER_TEMP/hermes-agent" pytest segno
+      - name: Run tests
+        run: python -m pytest -q tests

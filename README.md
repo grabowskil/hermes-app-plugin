@@ -5,6 +5,22 @@ serves them to the app together with attachment upload, message search and the a
 list, and pairs the app with your host through a QR code. Requires Hermes 0.22.2 or newer and the
 API server (`API_SERVER_KEY`).
 
+## About this repository
+
+This is the published source of the `hermes_app` plugin and the repository the Hermes plugin
+catalog points at. It is a read-only mirror, pushed automatically from a private development
+repository on every merge; pull requests here are overwritten by the next mirror push, so report
+problems as issues instead. The companion iOS app, **Petasos: Agent Command**, is distributed
+through the App Store only. Its source is not published and it cannot be built from this
+repository; the plugin here is everything the app needs on the gateway side.
+
+Install from this repository and restart the gateway:
+
+```sh
+hermes plugins install https://github.com/grabowskil/hermes-app-plugin.git
+hermes gateway restart
+```
+
 ## Routes
 
 All routes live on the API server's own port (default 8642) and need the same
@@ -41,7 +57,9 @@ The key is the API server key, read through Hermes's secret routes. Treat the co
    platform and use it as the delivery target for cron jobs and gateway notices (`deliver: hermes_app`).
 3. Restart the gateway: `hermes gateway restart`.
 
-## What it does on your machine
+## Disclosures
+
+What a user should know before installing (Hermes catalog rule 13):
 
 - Serves the routes above on the API server's port. It opens no listener of its own.
 - Reads `~/.hermes/state.db` read-only for search.
@@ -49,7 +67,9 @@ The key is the API server key, read through Hermes's secret routes. Treat the co
 - Stores notices and device tokens in `~/.hermes/hermes_app/` (`notices.jsonl`, `devices.json`, `widget_devices.json`; override the folder with `HERMES_APP_DATA_DIR`).
 - Keeps the agent's todo lists in memory.
 - Makes no network calls, runs no shell commands, starts no background processes, sends no telemetry.
-- `hermes app pair` reads `API_SERVER_KEY` through `agent.secret_scope` and prints it inside the link.
+- `hermes app pair` reads `API_SERVER_KEY` through `agent.secret_scope` and prints it inside the link. The plugin stores no credentials of its own and reads no `.env` or key files.
+- Third-party services: none. The only network peer is the app on your own network, talking to your API server.
+- `tests/`, `.github/` and this README are part of the mirror and are installed with the plugin; they do nothing at runtime.
 
 ## Files
 
