@@ -6,6 +6,11 @@ fails to load; its address carries ``code`` and ``state`` and goes to ``finish``
 site's ``secret.json`` (``refresh_token``, ``access_token``, ``expires_at``, optional
 ``client_secret``). ``refresh`` does its HTTP call outside the site lock and merges under it.
 Neither URLs with codes nor token responses are ever logged or put into an error message.
+
+Optional ``site.json`` keys (a missing key means the behaviour above): ``redirect_param`` (sent as
+``redirect_uri`` instead, e.g. an eBay RuName; the pasted address still matches ``redirect_uri``),
+``token_auth`` (``body`` | ``basic``: HTTP Basic header, no client id/secret in the form), ``pkce``
+(default true) and ``refresh_scope`` (send ``scopes`` on refresh).
 """
 import base64
 import hashlib
@@ -99,9 +104,8 @@ def start(site_id, redirect_uri=None) -> dict:
     ``redirect_uri`` overrides the site's (the host browser uses a one-shot loopback listener).
     """
     meta = _site(site_id)
-    redirect = redirect_uri or meta["redirect_uri"]
-    verifier = secrets.token_urlsafe(64)
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=")
+    redirect = redirect_uri or meta.get("redirect_param") or meta["redirect_uri"]
+    match_url = redirect_uri or meta["redirect_uri"]
     state = secrets.token_urlsafe(24)
     params = {
         "response_type": "code",
@@ -109,23 +113,26 @@ def start(site_id, redirect_uri=None) -> dict:
         "redirect_uri": redirect,
         "scope": meta.get("scopes") or "",
         "state": state,
-        "code_challenge": challenge.decode("ascii"),
-        "code_challenge_method": "S256",
     }
+    pending = {"state": state, "redirect_uri": redirect, "sent_redirect": redirect, "match_url": match_url,
+               "expires_at": time.time() + PENDING_TTL_S}
+    if meta.get("pkce", True) is not False:
+        verifier = secrets.token_urlsafe(64)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=")
+        params.update(code_challenge=challenge.decode("ascii"), code_challenge_method="S256")
+        pending["verifier"] = verifier
     url = meta["auth_url"] + ("&" if urlsplit(meta["auth_url"]).query else "?") + urlencode(params)
     if meta.get("extra_params"):
         url += "&" + meta["extra_params"]
-    pending = {"state": state, "verifier": verifier, "redirect_uri": redirect,
-               "expires_at": time.time() + PENDING_TTL_S}
     with sites._locked(site_id):
         _write_private(sites._dir(site_id) / "pending.json", pending)
-    return {"auth_url": url, "redirect_uri": redirect}
+    return {"auth_url": url, "redirect_uri": match_url}
 
 
-def _post(token_url: str, form: dict):
+def _post(token_url: str, form: dict, headers: dict | None = None):
     """POST a form. Returns (http status, parsed JSON dict). Raises OSError-like on network trouble."""
     req = Request(token_url, data=urlencode(form).encode("ascii"), method="POST", headers={
-        "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"})
+        "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json", **(headers or {})})
     try:
         with build_opener(_NoRedirect).open(req, timeout=TIMEOUT_S) as resp:
             status, raw = resp.status, resp.read(MAX_BYTES)
@@ -136,6 +143,21 @@ def _post(token_url: str, form: dict):
     except ValueError:
         body = {}
     return status, body if isinstance(body, dict) else {}
+
+
+def _client_auth(meta: dict, form: dict, client_secret):
+    """Add the client credentials to ``form``, or return a Basic header (``token_auth: basic``).
+
+    Raises ValueError("site has no client_secret") for basic without a stored secret."""
+    if meta.get("token_auth") == "basic":
+        if not client_secret:
+            raise ValueError("site has no client_secret")
+        cred = base64.b64encode(f"{meta['client_id']}:{client_secret}".encode("utf-8")).decode("ascii")
+        return {"Authorization": "Basic " + cred}
+    form["client_id"] = meta["client_id"]
+    if client_secret:
+        form["client_secret"] = client_secret
+    return None
 
 
 def _safe_code(value) -> str:
@@ -177,7 +199,7 @@ def finish(site_id, redirect_url) -> None:
         pending = json.loads((sites._dir(site_id) / "pending.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         pending = None
-    expected = pending.get("redirect_uri") if isinstance(pending, dict) else None
+    expected = (pending.get("match_url") or pending.get("redirect_uri")) if isinstance(pending, dict) else None
     if not matches_redirect(redirect_url, expected or meta["redirect_uri"]):
         raise ValueError("that is not the page the login ended on")
     q = parse_qs(urlsplit(redirect_url).query)
@@ -191,14 +213,14 @@ def finish(site_id, redirect_url) -> None:
         raise ValueError("sign-in expired, start again")
     if not code or not state or not secrets.compare_digest(str(state), str(pending.get("state"))):
         raise ValueError("sign-in did not match, start again")
-    form = {"client_id": meta["client_id"], "code": code, "code_verifier": pending["verifier"],
-            "redirect_uri": pending["redirect_uri"], "grant_type": "authorization_code"}
-    client_secret = sites.read_secret(site_id).get("client_secret")
-    if client_secret:
-        form["client_secret"] = client_secret
+    form = {"code": code, "redirect_uri": pending.get("sent_redirect") or pending["redirect_uri"],
+            "grant_type": "authorization_code"}
+    if pending.get("verifier") and meta.get("pkce", True) is not False:
+        form["code_verifier"] = pending["verifier"]
+    headers = _client_auth(meta, form, sites.read_secret(site_id).get("client_secret"))
     now = time.time()
     try:
-        status, body = _post(meta["token_url"], form)
+        status, body = _post(meta["token_url"], form, headers)
     except (URLError, OSError, ValueError):
         raise ValueError("token request failed (network)") from None
     if status != 200:
@@ -220,12 +242,17 @@ def refresh(site_id) -> str:
     if not refresh_token:
         _set_status(site_id, "expired", "not signed in")
         return "expired"
-    form = {"client_id": meta["client_id"], "refresh_token": refresh_token, "grant_type": "refresh_token"}
-    if secret.get("client_secret"):
-        form["client_secret"] = secret["client_secret"]
+    form = {"refresh_token": refresh_token, "grant_type": "refresh_token"}
+    if meta.get("refresh_scope") is True and meta.get("scopes"):
+        form["scope"] = meta["scopes"]
+    try:
+        headers = _client_auth(meta, form, secret.get("client_secret"))
+    except ValueError:
+        _set_status(site_id, "error", "no client_secret")
+        return "error"
     now = time.time()
     try:  # HTTP outside the lock
-        status, body = _post(meta["token_url"], form)
+        status, body = _post(meta["token_url"], form, headers)
     except (TimeoutError, socket.timeout):
         _set_status(site_id, "error", "timeout")
         return "error"

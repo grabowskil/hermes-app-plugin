@@ -49,11 +49,12 @@ def env(tmp_path, monkeypatch):
         monkeypatch.setattr(sites, "read_secret", _fallback_read_secret, raising=False)
         monkeypatch.setattr(sites, "write_secret", _fallback_write_secret, raising=False)
     state = {"status": 200, "body": {"access_token": "AT1", "refresh_token": "RT1", "expires_in": 3600},
-             "forms": []}
+             "forms": [], "headers": []}
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             raw = self.rfile.read(int(self.headers["Content-Length"]))
+            state["headers"].append(dict(self.headers))
             state["forms"].append({k: v[0] for k, v in parse_qs(raw.decode()).items()})
             payload = json.dumps(state["body"]).encode()
             self.send_response(state["status"])
@@ -230,3 +231,96 @@ def test_matches_redirect_ports():
 def test_google_preset():
     assert site_oauth.GOOGLE["redirect_uri"] == "http://localhost"
     assert site_oauth.GOOGLE["extra_params"] == "access_type=offline&prompt=consent"
+
+
+def _q(url):
+    return {k: v[0] for k, v in parse_qs(urlsplit(url).query).items()}
+
+
+def test_redirect_param_is_sent_and_accept_url_matched(env):
+    env.add(redirect_uri="https://accept.example/done", redirect_param="Ru-Name-123")
+    out = site_oauth.start("gg")
+    assert _q(out["auth_url"])["redirect_uri"] == "Ru-Name-123"
+    pending = json.loads((sites._dir("gg") / "pending.json").read_text())
+    assert pending["sent_redirect"] == "Ru-Name-123" and pending["redirect_uri"] == "Ru-Name-123"
+    assert pending["match_url"] == "https://accept.example/done"
+    with pytest.raises(ValueError):
+        site_oauth.finish("gg", f"http://localhost/?code=c&state={pending['state']}")
+    site_oauth.finish("gg", f"https://accept.example/done?code=the-code&state={pending['state']}")
+    assert env.state["forms"][0]["redirect_uri"] == "Ru-Name-123"
+
+
+def test_redirect_override_wins_over_redirect_param(env):
+    env.add(redirect_param="Ru-Name-123")
+    out = site_oauth.start("gg", "http://127.0.0.1:54321/")
+    assert _q(out["auth_url"])["redirect_uri"] == "http://127.0.0.1:54321/"
+    pending = json.loads((sites._dir("gg") / "pending.json").read_text())
+    site_oauth.finish("gg", f"http://127.0.0.1:54321/?code=the-code&state={pending['state']}")
+    assert env.state["forms"][0]["redirect_uri"] == "http://127.0.0.1:54321/"
+
+
+def test_basic_auth_header_and_clean_body(env):
+    env.add(token_auth="basic")
+    sites.write_secret("gg", {"client_secret": "csec"})
+    site_oauth.start("gg")
+    site_oauth.finish("gg", env.redirect())
+    expected = "Basic " + base64.b64encode(b"cid:csec").decode()
+    assert env.state["headers"][0]["Authorization"] == expected
+    assert "client_id" not in env.state["forms"][0] and "client_secret" not in env.state["forms"][0]
+    assert site_oauth.refresh("gg") == "ok"
+    assert env.state["headers"][1]["Authorization"] == expected
+    assert "client_id" not in env.state["forms"][1] and "client_secret" not in env.state["forms"][1]
+
+
+def test_basic_auth_without_client_secret(env):
+    env.add(token_auth="basic")
+    site_oauth.start("gg")
+    with pytest.raises(ValueError, match="site has no client_secret"):
+        site_oauth.finish("gg", env.redirect())
+    sites.write_secret("gg", {"refresh_token": "RT"})
+    assert site_oauth.refresh("gg") == "error"
+    assert sites._read("gg")["detail"] == "no client_secret"
+    assert env.state["forms"] == []
+
+
+def test_pkce_false_has_no_challenge_and_no_verifier(env):
+    env.add(pkce=False)
+    q = _q(site_oauth.start("gg")["auth_url"])
+    assert "code_challenge" not in q and "code_challenge_method" not in q
+    assert "verifier" not in json.loads((sites._dir("gg") / "pending.json").read_text())
+    site_oauth.finish("gg", env.redirect())
+    assert "code_verifier" not in env.state["forms"][0]
+
+
+def test_refresh_scope(env):
+    env.add()
+    sites.write_secret("gg", {"refresh_token": "RT"})
+    site_oauth.refresh("gg")
+    env.add(refresh_scope=True)
+    site_oauth.refresh("gg")
+    assert "scope" not in env.state["forms"][0] and env.state["forms"][1]["scope"] == "a b"
+
+
+def test_old_pending_shape_still_finishes(env):
+    env.add()
+    pending = {"state": "st", "verifier": "ver", "redirect_uri": "http://localhost",
+               "expires_at": time.time() + 60}
+    (sites._dir("gg") / "pending.json").write_text(json.dumps(pending))
+    site_oauth.finish("gg", "http://localhost/?code=the-code&state=st")
+    form = env.state["forms"][0]
+    assert form["redirect_uri"] == "http://localhost" and form["code_verifier"] == "ver"
+
+
+def test_google_style_site_forms_are_unchanged(env):
+    env.add()
+    sites.write_secret("gg", {"client_secret": "csec"})
+    q = _q(site_oauth.start("gg")["auth_url"])
+    assert set(q) == {"response_type", "client_id", "redirect_uri", "scope", "state", "code_challenge",
+                      "code_challenge_method", "access_type", "prompt"}
+    site_oauth.finish("gg", env.redirect())
+    assert set(env.state["forms"][0]) == {"client_id", "client_secret", "code", "code_verifier",
+                                          "redirect_uri", "grant_type"}
+    assert "Authorization" not in env.state["headers"][0]
+    site_oauth.refresh("gg")
+    assert env.state["forms"][1] == {"client_id": "cid", "client_secret": "csec",
+                                     "refresh_token": "RT1", "grant_type": "refresh_token"}
