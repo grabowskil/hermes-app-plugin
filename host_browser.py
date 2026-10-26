@@ -1,20 +1,25 @@
 """A throwaway browser on the host for logins that need a real browser (passkeys, Google OAuth).
 
-``start`` launches Chrome/Chromium with a fresh temporary profile and a random loopback debugging
-port; the user signs in at the host's screen; the caller then reads the cookies (``cookies``) or the
-open tab URLs (``page_urls``) and calls ``close``, which quits the browser, kills leftovers by
-profile path and deletes the profile. One session per site, closed automatically after 15 minutes.
+``start`` launches Chrome/Chromium with a fresh temporary profile and no debugging interface (Google
+refuses sign-in in a browser that has one). The user signs in at the host's screen. For cookie
+logins ``cookies`` quits the browser cleanly (SIGTERM flushes the cookie store), reads the profile's
+``Cookies`` SQLite file and decrypts the values; ``close`` kills leftovers by profile path and deletes
+the profile. One session per site, closed automatically after 15 minutes.
 
-On macOS the browser is started through ``open -n -a`` (from a launchd background session only
-``open`` lands in the GUI session with keychain access); elsewhere by direct exec. Cookie values
-and URLs are never logged.
+The profile uses ``--use-mock-keychain``, so values are encrypted with a fixed, well-known key
+(``v10``, AES-128-CBC) and no Keychain prompt appears. On macOS the browser is started through
+``open -n -a`` (from a launchd background session only ``open`` lands in the GUI session); elsewhere by
+direct exec. Cookie values and URLs are never logged.
 """
 import asyncio
+import hashlib
 import logging
 import os
+import plistlib
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -22,18 +27,17 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import aiohttp
-
 log = logging.getLogger(__name__)
 
 TTL = 900
 START_TIMEOUT = 20
+QUIT_TIMEOUT = 15
 KILL_TIMEOUT = 5
 MAC_APPS = ("/Applications/Google Chrome.app", "/Applications/Chromium.app")
 LINUX_BINARIES = ("google-chrome", "chromium", "chromium-browser")
-_HTTP = aiohttp.ClientTimeout(total=10)
+_EPOCH_DELTA_S = 11644473600  # 1601-01-01 to 1970-01-01
 
-# site_id -> {"profile": str, "port": int, "ws": str, "timer": TimerHandle}
+# site_id -> {"profile": str, "pid": int, "timer": TimerHandle}
 _sessions: dict = {}
 
 
@@ -63,17 +67,6 @@ def _resolve():
 
 def available() -> bool:
     return _resolve() is not None
-
-
-def _read_port(profile: str):
-    """``(port, ws_path)`` from ``<profile>/DevToolsActivePort`` once both lines are there, else None."""
-    try:
-        lines = (Path(profile) / "DevToolsActivePort").read_text().splitlines()
-        if len(lines) >= 2 and lines[0].strip().isdigit() and lines[1].strip().startswith("/"):
-            return int(lines[0].strip()), lines[1].strip()
-    except OSError:
-        pass
-    return None
 
 
 def _pids(profile: str) -> list:
@@ -114,6 +107,23 @@ async def _kill_and_remove(profile: str) -> None:
     shutil.rmtree(profile, ignore_errors=True)
 
 
+def _main_pid(profile: str):
+    """The browser's main process for ``profile`` (the one without ``--type=``), else None."""
+    pids = _pids(profile)
+    if not pids:
+        return None
+    try:
+        out = subprocess.run(["ps", "-ww", "-o", "pid=,command=", "-p", ",".join(map(str, pids))],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if pid.isdigit() and " --type=" not in command and f"--user-data-dir={profile}" in command:
+            return int(pid)
+    return None
+
+
 async def start(site_id: str, url: str) -> None:
     """Open ``url`` in a fresh browser. RuntimeError when no browser is found or it does not come up."""
     parts = urlsplit(url or "")
@@ -125,33 +135,34 @@ async def start(site_id: str, url: str) -> None:
     await close(site_id)
     profile = tempfile.mkdtemp(prefix="hermes-site-")
     os.chmod(profile, 0o700)
-    args = [f"--user-data-dir={profile}", "--remote-debugging-port=0", "--no-first-run",
-            "--no-default-browser-check", "--new-window", "--", url]
+    args = [f"--user-data-dir={profile}", "--use-mock-keychain", "--no-first-run",
+            "--no-default-browser-check", url]
     kind, path = target
     try:
+        pid = None
         if sys.platform == "darwin" and kind == "app":
             proc = await asyncio.create_subprocess_exec(
                 "/usr/bin/open", "-n", "-a", path, "--args", *args,
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            await proc.wait()
+            await proc.wait()  # returns before the browser runs: find its main process
         else:
             if kind == "app":
                 raise RuntimeError("no browser")
-            subprocess.Popen([path, *args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
-        found, end = None, time.monotonic() + START_TIMEOUT
-        while found is None and time.monotonic() < end:
-            found = _read_port(profile)
-            if found is None:
+            pid = subprocess.Popen([path, *args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True).pid
+        end = time.monotonic() + START_TIMEOUT
+        while pid is None and time.monotonic() < end:
+            pid = _main_pid(profile)
+            if pid is None:
                 await asyncio.sleep(0.25)
-        if found is None:
+        if pid is None:
             raise RuntimeError("browser did not start")
     except BaseException:
         await _kill_and_remove(profile)
         raise
     loop = asyncio.get_running_loop()
     timer = loop.call_later(TTL, lambda: loop.create_task(close(site_id)))
-    _sessions[site_id] = {"profile": profile, "port": found[0], "ws": found[1], "timer": timer}
+    _sessions[site_id] = {"profile": profile, "pid": pid, "timer": timer}
     log.info("host browser started for site %s", site_id)
 
 
@@ -162,52 +173,106 @@ def _session(site_id: str) -> dict:
     return s
 
 
-async def _get_json(site_id: str, path: str):
-    s = _session(site_id)
-    async with aiohttp.ClientSession(timeout=_HTTP) as http:
-        async with http.get(f"http://127.0.0.1:{s['port']}{path}") as r:
-            r.raise_for_status()
-            return await r.json(content_type=None)
+def _derive_key() -> bytes:
+    return hashlib.pbkdf2_hmac("sha1", b"mock_password", b"saltysalt", 1003, 16)
 
 
-async def _command(s: dict, method: str):
-    async with aiohttp.ClientSession(timeout=_HTTP) as http:
-        async with http.ws_connect(f"ws://127.0.0.1:{s['port']}{s['ws']}") as ws:
-            await ws.send_json({"id": 1, "method": method})
-            async for msg in ws:
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    break
-                data = msg.json()
-                if data.get("id") == 1:
-                    if "error" in data:
-                        raise RuntimeError("browser command failed")
-                    return data.get("result") or {}
-    return {}
+def _decrypt(blob: bytes, host_key: str, strip_hash: bool):
+    """The plain value of a ``v10`` blob, or None when it is not one or does not decrypt."""
+    if not blob.startswith(b"v10"):
+        return None
+    try:
+        from cryptography.hazmat.primitives import padding
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    except ImportError:
+        raise RuntimeError("the 'cryptography' package is missing in the gateway environment") from None
+    try:
+        dec = Cipher(algorithms.AES(_derive_key()), modes.CBC(b" " * 16)).decryptor()
+        padded = dec.update(blob[3:]) + dec.finalize()
+        unpad = padding.PKCS7(128).unpadder()
+        plain = unpad.update(padded) + unpad.finalize()
+    except ValueError:
+        return None
+    if strip_hash:
+        if plain[:32] != hashlib.sha256(host_key.encode("utf-8")).digest():
+            return None
+        plain = plain[32:]
+    try:
+        return plain.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
-async def cookies(site_id: str) -> list:
-    """All cookies of the browser in the app's cookie format."""
-    result = await _command(_session(site_id), "Storage.getCookies")
+def _read_cookies(profile: str) -> list:
+    db = Path(profile) / "Default" / "Cookies"
+    if not db.is_file():
+        return []
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    try:
+        try:
+            row = con.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()
+            strip_hash = int(row[0]) >= 24 if row else False
+        except (sqlite3.Error, ValueError, TypeError):
+            strip_hash = False
+        rows = con.execute(
+            "SELECT host_key, name, value, encrypted_value, path, expires_utc, is_secure, is_httponly, "
+            "has_expires, is_persistent FROM cookies").fetchall()
+    finally:
+        con.close()
     out = []
-    for c in result.get("cookies", []):
-        exp = c.get("expires")
-        out.append({
-            "name": c.get("name"), "value": c.get("value"), "domain": c.get("domain"),
-            "path": c.get("path") or "/",
-            "expires": None if c.get("session") or not isinstance(exp, (int, float)) or exp <= 0 else exp,
-            "secure": bool(c.get("secure")), "http_only": bool(c.get("httpOnly")),
-        })
+    for host, name, value, blob, path, expires_utc, secure, httponly, has_expires, persistent in rows:
+        if blob:
+            value = _decrypt(bytes(blob), host, strip_hash)
+            if value is None:
+                continue
+        expires = None
+        if has_expires and persistent and expires_utc:
+            expires = expires_utc / 1e6 - _EPOCH_DELTA_S
+        out.append({"name": name, "value": value or "", "domain": host, "path": path or "/",
+                    "expires": expires, "secure": bool(secure), "http_only": bool(httponly)})
     return out
 
 
-async def page_urls(site_id: str) -> list:
-    """URLs of the open tabs."""
-    return [t["url"] for t in await _get_json(site_id, "/json/list")
-            if t.get("type") == "page" and isinstance(t.get("url"), str)]
+async def _quit(s: dict) -> None:
+    """Ask the browser to quit (SIGTERM flushes cookies); SIGKILL whatever is left after the timeout."""
+    _signal([s["pid"]], signal.SIGTERM)
+    if await _wait_gone(s["profile"], QUIT_TIMEOUT):
+        _signal(_pids(s["profile"]), signal.SIGKILL)
+        await _wait_gone(s["profile"], 2)
+
+
+async def cookies(site_id: str) -> list:
+    """Stop the browser (flushing its cookie store), then all its cookies in the app's cookie format."""
+    s = _session(site_id)
+    await _quit(s)
+    return await asyncio.to_thread(_read_cookies, s["profile"])
+
+
+def _chrome_major(kind: str, path: str) -> str:
+    if kind == "app":
+        with open(Path(path) / "Contents" / "Info.plist", "rb") as f:
+            version = plistlib.load(f).get("CFBundleShortVersionString", "")
+    else:
+        version = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10).stdout
+    m = re.search(r"(\d+)\.", version)
+    if not m:
+        raise RuntimeError("browser version unknown")
+    return m.group(1)
 
 
 async def user_agent(site_id: str) -> str:
-    return (await _get_json(site_id, "/json/version")).get("User-Agent", "")
+    """Chrome's reduced user agent for the installed browser version."""
+    _session(site_id)
+    target = _resolve()
+    if target is None:
+        raise RuntimeError("no browser")
+    try:
+        major = await asyncio.to_thread(_chrome_major, *target)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise RuntimeError("browser version unknown") from None
+    platform = "Macintosh; Intel Mac OS X 10_15_7" if sys.platform == "darwin" else "X11; Linux x86_64"
+    return (f"Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{major}.0.0.0 Safari/537.36")
 
 
 async def close(site_id: str) -> None:
@@ -216,11 +281,6 @@ async def close(site_id: str) -> None:
     if s is None:
         return
     s["timer"].cancel()
-    try:
-        await _command(s, "Browser.close")
-    except Exception:
-        pass
-    await _wait_gone(s["profile"], 2)
     await _kill_and_remove(s["profile"])
 
 

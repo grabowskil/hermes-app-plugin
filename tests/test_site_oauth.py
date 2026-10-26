@@ -103,6 +103,21 @@ def test_finish_exchanges_and_stores(env):
     assert sites._read("gg")["status"] == "ok"
 
 
+def test_start_redirect_override_is_stored_and_used_by_finish(env):
+    env.add()
+    out = site_oauth.start("gg", "http://127.0.0.1:54321/")
+    assert out["redirect_uri"] == "http://127.0.0.1:54321/"
+    q = {k: v[0] for k, v in parse_qs(urlsplit(out["auth_url"]).query).items()}
+    assert q["redirect_uri"] == "http://127.0.0.1:54321/"
+    pending = json.loads((sites._dir("gg") / "pending.json").read_text())
+    assert pending["redirect_uri"] == "http://127.0.0.1:54321/"
+    with pytest.raises(ValueError):  # the site's own redirect no longer matches
+        site_oauth.finish("gg", f"http://localhost/?code=c&state={pending['state']}")
+    site_oauth.finish("gg", f"http://127.0.0.1:54321/?code=the-code&state={pending['state']}")
+    assert env.state["forms"][0]["redirect_uri"] == "http://127.0.0.1:54321/"
+    assert sites.read_secret("gg")["refresh_token"] == "RT1"
+
+
 def test_state_mismatch(env):
     env.add()
     site_oauth.start("gg")

@@ -93,16 +93,20 @@ def matches_redirect(url, redirect_uri) -> bool:
         return False
 
 
-def start(site_id) -> dict:
-    """Create state + PKCE, store ``pending.json`` and return the URL the user must open."""
+def start(site_id, redirect_uri=None) -> dict:
+    """Create state + PKCE, store ``pending.json`` and return the URL the user must open.
+
+    ``redirect_uri`` overrides the site's (the host browser uses a one-shot loopback listener).
+    """
     meta = _site(site_id)
+    redirect = redirect_uri or meta["redirect_uri"]
     verifier = secrets.token_urlsafe(64)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=")
     state = secrets.token_urlsafe(24)
     params = {
         "response_type": "code",
         "client_id": meta["client_id"],
-        "redirect_uri": meta["redirect_uri"],
+        "redirect_uri": redirect,
         "scope": meta.get("scopes") or "",
         "state": state,
         "code_challenge": challenge.decode("ascii"),
@@ -111,11 +115,11 @@ def start(site_id) -> dict:
     url = meta["auth_url"] + ("&" if urlsplit(meta["auth_url"]).query else "?") + urlencode(params)
     if meta.get("extra_params"):
         url += "&" + meta["extra_params"]
-    pending = {"state": state, "verifier": verifier, "redirect_uri": meta["redirect_uri"],
+    pending = {"state": state, "verifier": verifier, "redirect_uri": redirect,
                "expires_at": time.time() + PENDING_TTL_S}
     with sites._locked(site_id):
         _write_private(sites._dir(site_id) / "pending.json", pending)
-    return {"auth_url": url, "redirect_uri": meta["redirect_uri"]}
+    return {"auth_url": url, "redirect_uri": redirect}
 
 
 def _post(token_url: str, form: dict):
@@ -169,17 +173,20 @@ def finish(site_id, redirect_url) -> None:
     if not isinstance(redirect_url, str) or len(redirect_url) > 4096:
         raise ValueError("bad address")
     redirect_url = redirect_url.strip()
-    if not matches_redirect(redirect_url, meta["redirect_uri"]):
+    try:
+        pending = json.loads((sites._dir(site_id) / "pending.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pending = None
+    expected = pending.get("redirect_uri") if isinstance(pending, dict) else None
+    if not matches_redirect(redirect_url, expected or meta["redirect_uri"]):
         raise ValueError("that is not the page the login ended on")
     q = parse_qs(urlsplit(redirect_url).query)
     err = q.get("error", [None])[0]
     if err:
         raise ValueError(f"sign-in refused: {_safe_code(err)}")
     code, state = q.get("code", [None])[0], q.get("state", [None])[0]
-    try:
-        pending = json.loads((sites._dir(site_id) / "pending.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        raise ValueError("no sign-in in progress, start again") from None
+    if pending is None:
+        raise ValueError("no sign-in in progress, start again")
     if not isinstance(pending, dict) or time.time() > float(pending.get("expires_at") or 0):
         raise ValueError("sign-in expired, start again")
     if not code or not state or not secrets.compare_digest(str(state), str(pending.get("state"))):

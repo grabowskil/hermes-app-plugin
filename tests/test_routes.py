@@ -104,8 +104,9 @@ class FakeOAuth:
     def __init__(self):
         self.finished = []
 
-    def start(self, site_id):
-        return {"auth_url": "https://auth.example.com/?state=x", "redirect_uri": "http://localhost"}
+    def start(self, site_id, redirect_uri=None):
+        self.redirects = getattr(self, "redirects", []) + [redirect_uri]
+        return {"auth_url": "https://auth.example.com/?state=x", "redirect_uri": redirect_uri or "http://localhost"}
 
     def finish(self, site_id, redirect_url):
         if "code=" not in redirect_url:
@@ -117,9 +118,8 @@ class FakeOAuth:
 
 
 class FakeBrowser:
-    def __init__(self, is_available=True, urls=()):
+    def __init__(self, is_available=True):
         self.is_available = is_available
-        self.urls = list(urls)
         self.started = []
         self.closed = []
 
@@ -131,9 +131,6 @@ class FakeBrowser:
 
     async def cookies(self, site_id):
         return [{"name": "SID", "value": SECRET}]
-
-    async def page_urls(self, site_id):
-        return self.urls
 
     async def user_agent(self, site_id):
         return "UA"
@@ -429,14 +426,17 @@ def test_host_login_unavailable_and_wrong_kind(fake_browser):
     assert fake_browser.started == []
 
 
-def test_host_login_starts_browser(fake_browser):
+def test_host_login_starts_browser(fake_oauth, fake_browser):
     async def go(c):
         cookie = await c.post("/app/v1/sites/yt/host-login", headers=AUTH)
         oauth = await c.post("/app/v1/sites/oa/host-login", headers=AUTH)
-        return cookie.status, await cookie.json(), oauth.status
+        listening = set(routes._listeners)
+        routes._stop_all_listeners()
+        return cookie.status, await cookie.json(), oauth.status, listening
 
-    assert _run(go) == (200, {"ok": True}, 200)
+    assert _run(go) == (200, {"ok": True}, 200, {"oa"})
     assert fake_browser.started == [("yt", VIEW["login_url"]), ("oa", "https://auth.example.com/?state=x")]
+    assert re.fullmatch(r"http://127\.0\.0\.1:\d+/", fake_oauth.redirects[0])
 
 
 def test_host_login_finish_cookie(fake_sites, fake_browser):
@@ -454,18 +454,49 @@ def test_host_login_finish_cookie(fake_sites, fake_browser):
     assert fake_browser.closed == ["yt", "yt", "*"]
 
 
-def test_host_login_finish_oauth(fake_oauth, fake_browser):
-    fake_browser.urls = ["https://auth.example.com/consent", "http://localhost/?code=abc", "http://localhost/?code=zzz"]
+async def _hit(redirect: str, path: str) -> str:
+    """One raw HTTP GET to the listener; the response text."""
+    host, port = redirect.removeprefix("http://").rstrip("/").split(":")
+    reader, writer = await asyncio.open_connection(host, int(port))
+    writer.write(f"GET {path} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    await writer.drain()
+    raw = await reader.read()
+    writer.close()
+    return raw.decode()
 
+
+def test_host_login_oauth_listener_finishes_and_save_confirms(fake_oauth, fake_browser):
     async def go(c):
+        await c.post("/app/v1/sites/oa/host-login", headers=AUTH)
+        redirect = fake_oauth.redirects[0]
+        early = await c.post("/app/v1/sites/oa/host-login/finish", json={"save": True}, headers=AUTH)
+        # second round: the redirect arrives
+        await c.post("/app/v1/sites/oa/host-login", headers=AUTH)
+        redirect = fake_oauth.redirects[1]
+        favicon = await _hit(redirect, "/favicon.ico")
+        answer = await _hit(redirect, "/?code=abc&state=zz")
         ok = await c.post("/app/v1/sites/oa/host-login/finish", json={"save": True}, headers=AUTH)
-        fake_browser.urls = ["https://auth.example.com/consent"]
-        unfinished = await c.post("/app/v1/sites/oa/host-login/finish", json={"save": True}, headers=AUTH)
-        return ok.status, unfinished.status
+        return redirect, early.status, favicon, answer, ok.status, await ok.json(), set(routes._listeners)
 
-    assert _run(go) == (200, 400)
-    assert fake_oauth.finished == [("oa", "http://localhost/?code=abc")]
+    redirect, early, favicon, answer, ok, body, left = _run(go)
+    assert early == 400
+    assert favicon.startswith("HTTP/1.1 404")
+    assert "200 OK" in answer and "Signed in. You can close this window." in answer
+    assert (ok, body, left) == (200, OAUTH_VIEW, set())
+    assert fake_oauth.finished == [("oa", redirect + "?code=abc&state=zz")]
     assert fake_browser.closed == ["oa", "oa", "*"]
+
+
+def test_host_login_oauth_failed_redirect_is_not_saved(fake_oauth, fake_browser):
+    async def go(c):
+        await c.post("/app/v1/sites/oa/host-login", headers=AUTH)
+        answer = await _hit(fake_oauth.redirects[0], "/?error=access_denied")  # FakeOAuth.finish raises
+        res = await c.post("/app/v1/sites/oa/host-login/finish", json={"save": True}, headers=AUTH)
+        return answer, res.status
+
+    answer, status = _run(go)
+    assert "Sign-in failed" in answer and status == 400
+    assert fake_oauth.finished == []
 
 
 def test_cleanup_closes_host_browser(fake_browser):

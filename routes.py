@@ -230,6 +230,73 @@ async def oauth_finish(request: web.Request) -> web.Response:
     return web.json_response(view) if view is not None else _unknown()
 
 
+LISTENER_TTL = 900
+_LISTENER_HTML = "<!doctype html><meta charset=utf-8><title>Hermes</title><p>{}</p>"
+# site_id -> {"server": asyncio.Server, "ok": Optional[bool], "timer": TimerHandle}
+_listeners: dict = {}
+
+
+def _stop_listener(site_id: str) -> None:
+    """Close the one-shot loopback listener and forget its result."""
+    entry = _listeners.pop(site_id, None)
+    if entry is not None:
+        entry["server"].close()
+        entry["timer"].cancel()
+
+
+def _stop_all_listeners() -> None:
+    for site_id in list(_listeners):
+        _stop_listener(site_id)
+
+
+async def _open_listener(site_id: str) -> str:
+    """Listen once on 127.0.0.1 (random port) for the OAuth redirect and finish the login with it.
+
+    Returns the redirect URI. The result (True/False) is kept in ``_listeners[site_id]["ok"]``.
+    """
+    _stop_listener(site_id)
+    entry = {"server": None, "ok": None, "timer": None}
+
+    async def respond(writer, status: str, text: str) -> None:
+        body = _LISTENER_HTML.format(text).encode()
+        writer.write(f"HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n"
+                     f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
+        try:
+            await writer.drain()
+        finally:
+            writer.close()
+
+    async def handle(reader, writer) -> None:
+        try:
+            line = await asyncio.wait_for(reader.readline(), 10)
+            parts = line.decode("latin-1").split()
+            target = parts[1] if len(parts) >= 2 and parts[1].startswith("/") else None
+            if target is None or entry["ok"] is not None or not ("code=" in target or "error=" in target):
+                await respond(writer, "404 Not Found", "Not found")  # favicon and the like
+                return
+            entry["ok"] = False  # claim the one shot before the slow token request
+            url = f"http://127.0.0.1:{port}{target}"
+            try:
+                await asyncio.to_thread(site_oauth.finish, site_id, url)
+                entry["ok"] = True
+            except Exception:
+                logger.warning("host login redirect for site %s did not finish", site_id)
+            if entry["ok"]:
+                await respond(writer, "200 OK", "Signed in. You can close this window.")
+            else:
+                await respond(writer, "200 OK", "Sign-in failed. Close this window and try again.")
+            entry["server"].close()
+        except Exception:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    entry["server"] = server
+    entry["timer"] = asyncio.get_running_loop().call_later(LISTENER_TTL, _stop_listener, site_id)
+    _listeners[site_id] = entry
+    return f"http://127.0.0.1:{port}/"
+
+
 async def host_login(request: web.Request) -> web.Response:
     site_id = request.match_info["id"]
     view = await _view(site_id)
@@ -242,16 +309,22 @@ async def host_login(request: web.Request) -> web.Response:
         return web.json_response({"error": "host login unavailable"}, status=501)
     try:
         if kind == "oauth":
-            url = (await asyncio.to_thread(site_oauth.start, site_id))["auth_url"]
+            redirect = await _open_listener(site_id)
+            url = (await asyncio.to_thread(site_oauth.start, site_id, redirect))["auth_url"]
         else:
             url = view.get("login_url")
         if not url:
             return _bad()
         await host_browser.start(site_id, url)
     except KeyError:
+        _stop_listener(site_id)
         return _unknown()
     except ValueError:
+        _stop_listener(site_id)
         return _bad()
+    except BaseException:
+        _stop_listener(site_id)
+        raise
     return web.json_response({"ok": True})
 
 
@@ -264,20 +337,19 @@ async def host_login_finish(request: web.Request) -> web.Response:
     view = await _view(site_id)
     if view is None:
         return _unknown()
+    oauth = (view.get("kind") or "cookie") == "oauth"
     try:
         if save:
-            if (view.get("kind") or "cookie") == "oauth":
-                urls = await host_browser.page_urls(site_id)
-                match = next((u for u in urls if site_oauth.matches_redirect(u, view.get("redirect_uri") or "")), None)
-                if match is None:
+            if oauth:
+                entry = _listeners.get(site_id)
+                if entry is None or entry["ok"] is not True:
                     return web.json_response({"error": "login not finished"}, status=400)
-                try:
-                    await asyncio.to_thread(site_oauth.finish, site_id, match)
-                except ValueError:
-                    return web.json_response({"error": "login failed"}, status=400)
             else:
-                cookies = await host_browser.cookies(site_id)
-                user_agent = await host_browser.user_agent(site_id)
+                try:
+                    cookies = await host_browser.cookies(site_id)
+                    user_agent = await host_browser.user_agent(site_id)
+                except RuntimeError:
+                    return web.json_response({"error": "host login failed"}, status=500)
                 try:
                     await asyncio.to_thread(sites.save_session, site_id, cookies, user_agent)
                 except ValueError:
@@ -286,6 +358,7 @@ async def host_login_finish(request: web.Request) -> web.Response:
     except KeyError:
         return _unknown()
     finally:
+        _stop_listener(site_id)
         await host_browser.close(site_id)
     view = await _view(site_id)
     return web.json_response(view) if view is not None else _unknown()
@@ -300,6 +373,7 @@ def _start_keepalive(publish):
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        _stop_all_listeners()
         await host_browser.close_all()
 
     return start, stop
