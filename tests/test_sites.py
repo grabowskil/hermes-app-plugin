@@ -394,6 +394,13 @@ def test_api_key_ok_sends_header_and_stores_key_privately(env):
     v = sites.check("api")
     assert v["status"] == "ok" and v["detail"] is None and v["checked_at"]
     assert env.state["auth"][-1] == f"Bearer {KEY}"
+    assert json.loads((sites._dir("api") / "secret.json").read_text()) == {"api_key": KEY}
+
+
+def test_api_key_written_before_2_2_1_is_still_read(env):
+    add_key_site(env)
+    (sites._dir("api") / "secret.json").write_text(json.dumps({"key": KEY}))
+    assert sites.secret("api") == KEY and sites.get("api")["has_secret"] is True
 
 
 def test_api_key_custom_header_and_prefix(env):

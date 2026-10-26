@@ -185,8 +185,8 @@ def _has_secret(meta: dict) -> tuple[bool, bool]:
         secret = read_secret(meta["id"])
     except (ValueError, KeyError, OSError):
         return False, False
-    key = "key" if _kind(meta) == "api_key" else "refresh_token"
-    return bool(secret.get(key)), bool(secret.get("client_secret"))
+    has = _api_key(secret) if _kind(meta) == "api_key" else secret.get("refresh_token")
+    return bool(has), bool(secret.get("client_secret"))
 
 
 def _view(meta: dict) -> dict:
@@ -409,7 +409,7 @@ def set_api_key(site_id, key) -> dict:
         raise ValueError("bad key")
     with _locked(site_id):
         meta = _read(site_id)
-        _merge_secret(site_id, {"key": key})
+        _merge_secret(site_id, {"api_key": key, "key": None})
         unchecked = not meta.get("check_url")
         meta.update(saved_at=_now(), checked_at=_now() if unchecked else None,
                     status="ok" if unchecked else "error", detail="not checked",
@@ -423,7 +423,7 @@ def secret(site_id) -> str:
     meta = _read(site_id)
     kind = _kind(meta)
     if kind == "api_key":
-        key = read_secret(site_id).get("key")
+        key = _api_key(read_secret(site_id))
         if not key:
             raise ValueError("no key set")
         return key
@@ -499,8 +499,13 @@ def _fetch_key(url: str, header: str, value: str) -> None:
         resp.read(1)
 
 
+def _api_key(secret: dict):
+    """The stored key; ``key`` is the name used before 2.2.1."""
+    return secret.get("api_key") or secret.get("key")
+
+
 def _check_api_key(site_id: str, meta: dict) -> dict:
-    key = read_secret(site_id).get("key")
+    key = _api_key(read_secret(site_id))
     if not key:
         return _view(meta)
     saved_at = meta.get("saved_at")

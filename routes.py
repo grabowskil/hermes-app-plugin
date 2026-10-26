@@ -20,7 +20,7 @@ from . import host_browser, search, site_oauth, sites, store, todos, upload
 logger = logging.getLogger(__name__)
 
 PLUGIN = "hermes_app"
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 FEATURES = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage"]
 PREFIX = "/app/v1"
 KEEPALIVE_KEY = web.AppKey("hermes_app_sites_keepalive", asyncio.Task)  # the keepalive task
