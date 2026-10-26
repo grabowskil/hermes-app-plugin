@@ -206,10 +206,10 @@ def test_capabilities(fake_browser):
         r = await c.get("/app/v1/capabilities", headers=AUTH)
         return r.status, await r.json()
 
-    base = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage"]
-    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.2.1", "features": base + ["host_login"]})
+    base = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "site_providers"]
+    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.3.0", "features": base + ["host_login"]})
     fake_browser.is_available = False
-    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.2.1", "features": base})
+    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.3.0", "features": base})
 
 
 def test_version_matches_manifest():
@@ -424,6 +424,32 @@ def test_host_login_unavailable_and_wrong_kind(fake_browser):
 
     assert _run(go) == (400, 501)
     assert fake_browser.started == []
+
+
+def test_providers_route_hides_config():
+    async def go(c):
+        anon = await c.get("/app/v1/sites/providers")
+        r = await c.get("/app/v1/sites/providers", headers=AUTH)
+        return anon.status, r.status, await r.json(), await r.text()
+
+    anon, status, body, text = _run(go)
+    assert (anon, status) == (401, 200)
+    assert [p["id"] for p in body["providers"]] == ["google", "ebay"]
+    ebay = body["providers"][1]
+    assert set(ebay) == {"id", "name", "kind", "help", "flows", "fields"} and ebay["flows"] == ["safari"]
+    assert [f["key"] for f in ebay["fields"]] == ["client_id", "client_secret", "redirect_param", "redirect_uri", "scopes"]
+    assert "token_url" not in text and "auth_url" not in text and "token_auth" not in text
+
+
+def test_host_login_refused_with_redirect_param(fake_sites, fake_oauth, fake_browser):
+    fake_sites.views["eb"] = {**OAUTH_VIEW, "id": "eb", "redirect_param": "Ru-Name", "provider": "ebay"}
+
+    async def go(c):
+        r = await c.post("/app/v1/sites/eb/host-login", headers=AUTH)
+        return r.status, await r.json(), set(routes._listeners)
+
+    assert _run(go) == (400, {"error": "sign in with Safari for this site"}, set())
+    assert fake_browser.started == [] and not hasattr(fake_oauth, "redirects")
 
 
 def test_host_login_starts_browser(fake_oauth, fake_browser):

@@ -36,6 +36,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPCookieProcessor, HTTPRedirectHandler, Request, build_opener
 
+from . import site_providers
 from .store import _data_dir
 
 log = logging.getLogger(__name__)
@@ -50,6 +51,8 @@ _ID = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
 _HEADER = re.compile(r"[A-Za-z0-9-]{1,64}")
 _KINDS = ("cookie", "api_key", "oauth")
+# optional oauth keys (plan 0009); a missing key means the old behaviour. Carried only through ``base``.
+_OPTIONAL = ("provider", "redirect_param", "token_auth", "pkce", "refresh_scope")
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 _ALLOW_HTTP = False  # tests only: lets check_url point at a local http server
 
@@ -204,13 +207,16 @@ def _view(meta: dict) -> dict:
         "checked_at": meta.get("checked_at"),
         "saved_at": meta.get("saved_at"),
         "detail": meta.get("detail"),
+        "provider": meta.get("provider"),
+        "flows": (site_providers.get(meta.get("provider")) or {}).get("flows"),
     }
     if kind == "cookie":
         view.update(check_url=check_url, marker=meta.get("marker"))
     elif kind == "api_key":
         view.update(check_url=check_url, header=meta.get("header"), prefix=meta.get("prefix"))
     else:
-        view.update({k: meta.get(k) for k in ("auth_url", "token_url", "client_id", "scopes", "redirect_uri")})
+        view.update({k: meta.get(k) for k in ("auth_url", "token_url", "client_id", "scopes", "redirect_uri",
+                                                         "redirect_param")})
         view["has_client_secret"] = has_client_secret
     return view
 
@@ -278,8 +284,11 @@ def _oauth_module():
     return importlib.import_module(f"{__package__}.site_oauth")
 
 
-def _fields_for(kind: str, fields: dict, base: dict, preset) -> dict:
-    """The validated, kind specific part of site.json. Missing field = keep ``base``, "" = clear."""
+def _fields_for(kind: str, fields: dict, base: dict, provider, local: bool = False) -> dict:
+    """The validated, kind specific part of site.json. Missing field = keep ``base``, "" = clear.
+
+    ``local`` (the CLI): explicit ``auth_url``/``token_url``/``redirect_param`` are accepted.
+    """
 
     def get(key, default=None):
         v = fields.get(key)
@@ -303,15 +312,40 @@ def _fields_for(kind: str, fields: dict, base: dict, preset) -> dict:
         return {"check_url": None if check_url is None else _url(check_url, "check_url"),
                 "header": header, "prefix": _text(prefix, "prefix", 64, required=False)}
     out = {}
-    if preset:
-        google = _oauth_module().GOOGLE
-        out["extra_params"] = google["extra_params"]
-        for key in ("auth_url", "token_url", "redirect_uri"):  # explicit fields (e.g. a client file) win
+    defaults = {}
+    redirect_param = base.get("redirect_param")
+    if provider:
+        cfg = provider["config"]
+        listed = {f["key"] for f in provider["fields"]}
+        defaults = {f["key"]: f["default"] for f in provider["fields"] if "default" in f}
+        defaults.update({k: cfg[k] for k in ("redirect_uri", "scopes") if k in cfg})
+        allowed = set(site_providers.FIELD_KEYS) if local else listed & set(site_providers.FIELD_KEYS)
+        if local:
+            allowed |= {"auth_url", "token_url"}
+        fields = {k: v for k, v in fields.items() if k in allowed}
+        for key in ("auth_url", "token_url"):  # explicit fields (a CLI client file) win
             if fields.get(key) in (None, ""):
-                fields = {**fields, key: google[key]}
+                fields[key] = cfg[key]
+        if fields.get("redirect_uri") in (None, "") and "redirect_uri" in defaults:
+            fields["redirect_uri"] = defaults["redirect_uri"]
+        out["extra_params"] = cfg.get("extra_params")
+        for key in ("token_auth", "pkce", "refresh_scope"):
+            if key in cfg:
+                out[key] = cfg[key]
+        if local or "redirect_param" in listed:
+            redirect_param = get("redirect_param")
+        if any(f["key"] == "redirect_param" and f.get("required") for f in provider["fields"]) and not redirect_param:
+            raise ValueError("bad redirect_param")
     else:
-        out["extra_params"] = base.get("extra_params")  # never from the request: presets and CLI only
-    scopes = get("scopes")
+        out["extra_params"] = base.get("extra_params")  # never from the request: providers and CLI only
+        for key in ("token_auth", "pkce", "refresh_scope"):
+            if key in base:
+                out[key] = base[key]
+        if local:
+            redirect_param = get("redirect_param")
+    if redirect_param is not None:
+        out["redirect_param"] = _text(redirect_param, "redirect_param", 256)
+    scopes = get("scopes", defaults.get("scopes"))
     if isinstance(scopes, list) and all(isinstance(x, str) for x in scopes):
         scopes = " ".join(scopes)
     out.update(
@@ -320,6 +354,10 @@ def _fields_for(kind: str, fields: dict, base: dict, preset) -> dict:
         scopes=_text(scopes, "scopes", 1024, required=False),
         redirect_uri=_redirect_uri(get("redirect_uri")))
     _text(out["extra_params"], "extra_params", 512, required=False)
+    if provider:
+        out["provider"] = provider["id"]
+    elif base.get("provider") and not (local and (fields.get("auth_url") or fields.get("token_url"))):
+        out["provider"] = base["provider"]
     return out
 
 
@@ -328,11 +366,14 @@ def _trust_host(meta: dict) -> str:
     return _host(meta.get("token_url" if _kind(meta) == "oauth" else "check_url") or "")
 
 
-def put(fields: dict) -> dict:
+def put(fields: dict, local: bool = False) -> dict:
     """Add or change a site (any kind). ValueError for bad input. Adding an existing id updates it.
 
     Changing the kind, or the host of ``check_url``/``token_url``, drops the stored credentials.
-    ``client_secret`` goes to secret.json only; ``extra_params`` only comes from a preset.
+    ``client_secret`` goes to secret.json only. ``provider`` (alias ``preset``) names an entry of
+    ``site_providers``; its server-only config (``extra_params``, ``token_auth``, ``pkce``,
+    ``refresh_scope``, endpoints) is copied into site.json and never comes from the request.
+    ``local`` is for the CLI: explicit endpoints and ``redirect_param`` are accepted.
     """
     if not isinstance(fields, dict):
         raise ValueError("bad site")
@@ -341,16 +382,17 @@ def put(fields: dict) -> dict:
         raise ValueError("bad name")
     site_id = fields.get("id") or _slug(name)
     _dir(site_id)
-    preset = fields.get("preset") or None
-    if preset not in (None, "google"):
-        raise ValueError("bad preset")
+    provider_id = fields.get("provider") or fields.get("preset") or None
+    provider = site_providers.get(provider_id) if provider_id is not None else None
+    if provider_id is not None and provider is None:
+        raise ValueError("bad provider")
     try:
         existing = _read(site_id)
     except KeyError:
         existing = None
-    kind = fields.get("kind") or ("oauth" if preset else _kind(existing or {}))
+    kind = fields.get("kind") or ("oauth" if provider else _kind(existing or {}))
     kind = "api_key" if kind == "api-key" else kind
-    if kind not in _KINDS or (preset and kind != "oauth"):
+    if kind not in _KINDS or (provider and kind != provider["kind"]):
         raise ValueError("bad kind")
     client_secret = fields.get("client_secret")
     if client_secret == "":
@@ -358,7 +400,9 @@ def put(fields: dict) -> dict:
     if client_secret is not None and (kind != "oauth" or not _text(client_secret, "client_secret", 1024)):
         raise ValueError("bad client_secret")
     base = existing if existing is not None and _kind(existing) == kind else {}
-    new = {"id": site_id, "name": name.strip(), "kind": kind, **_fields_for(kind, fields, base, preset)}
+    if provider and base.get("provider") not in (None, provider["id"]):
+        base = {}  # another provider: nothing carries over
+    new = {"id": site_id, "name": name.strip(), "kind": kind, **_fields_for(kind, fields, base, provider, local)}
     with _locked(site_id):
         try:
             meta = _read(site_id)
@@ -372,7 +416,7 @@ def put(fields: dict) -> dict:
             "status": "missing", "checked_at": None, "saved_at": None, "detail": None,
             "misses": 0, "notified": False, "user_agent": None,
         }
-        meta = {**(meta or fresh), **new}
+        meta = {**({k: v for k, v in meta.items() if k not in _OPTIONAL} if meta else fresh), **new}
         _store(site_id, meta)
         if client_secret is not None:
             _merge_secret(site_id, {"client_secret": client_secret})
@@ -692,10 +736,10 @@ def _client_json(path: str) -> dict:
 
 
 def _cli_add(args) -> int:
-    kind = args.kind or ("oauth" if args.preset or args.client_json else None)
-    fields = {"id": args.id, "name": args.name, "kind": kind, "preset": args.preset}
+    kind = args.kind or ("oauth" if args.provider or args.client_json else None)
+    fields = {"id": args.id, "name": args.name, "kind": kind, "provider": args.provider}
     for key in ("login_url", "check_url", "marker", "header", "prefix", "auth_url", "token_url",
-                "client_id", "scopes", "redirect_uri"):
+                "client_id", "scopes", "redirect_uri", "redirect_param"):
         fields[key] = getattr(args, key)
     try:
         if args.client_json:
@@ -704,11 +748,17 @@ def _cli_add(args) -> int:
                     fields[key] = value
         elif kind == "oauth" and sys.stdin.isatty():
             fields["client_secret"] = getpass.getpass("client secret (Enter to skip): ") or None
-        v = put({k: x for k, x in fields.items() if x is not None})
+        v = put({k: x for k, x in fields.items() if x is not None}, local=True)
     except (ValueError, OSError) as e:  # messages never carry file contents or secrets
         print(f"error: {e if isinstance(e, ValueError) else 'cannot read the client file'}", file=sys.stderr)
         return 1
     print(f"{v['id']}\t{v['status']}\t{v['name']}\t{v['kind']}")
+    return 0
+
+
+def _cli_providers(args) -> int:
+    for p in site_providers.PROVIDERS.values():
+        print(f"{p['id']}\t{p['name']}")
     return 0
 
 
@@ -760,8 +810,8 @@ def _cli_path(args) -> int:
 
 
 def setup_cli(sub) -> None:
-    """Add ``sites list | add | set-key | remove | path | secret`` to the ``hermes app`` subparsers."""
-    sites = sub.add_parser("sites", help="Sites the app can log in to (list, add, set-key, remove, path, secret)")
+    """Add ``sites list | add | providers | set-key | remove | path | secret`` to the ``hermes app`` subparsers."""
+    sites = sub.add_parser("sites", help="Sites the app can log in to (list, add, providers, set-key, remove, path, secret)")
     ssub = sites.add_subparsers(dest="sites_command")
     sites.set_defaults(func=lambda args: sites.print_help() or 0)
     p = ssub.add_parser("list", help="List sites and their login status")
@@ -770,7 +820,7 @@ def setup_cli(sub) -> None:
     p.add_argument("id", help="lowercase letters, digits and dashes")
     p.add_argument("--name", required=True)
     p.add_argument("--kind", choices=["cookie", "api-key", "oauth"],
-                   help="default cookie (oauth with --preset or --client-json)")
+                   help="default cookie (oauth with --provider or --client-json)")
     p.add_argument("--login-url", help="cookie: https page the app opens for the login")
     p.add_argument("--check-url", help="https page fetched to test the login (optional for api-key)")
     p.add_argument("--marker", help="cookie: text that appears on check-url only when logged in")
@@ -781,11 +831,17 @@ def setup_cli(sub) -> None:
     p.add_argument("--client-id", help="oauth")
     p.add_argument("--scopes", help="oauth: space separated")
     p.add_argument("--redirect-uri", help="oauth: https or http://localhost")
-    p.add_argument("--preset", choices=["google"], help="oauth: fill the Google endpoints")
+    p.add_argument("--redirect-param", help="oauth: value sent as redirect_uri when the provider "
+                   "registers a name instead (eBay RuName); the pasted address is matched against --redirect-uri")
+    p.add_argument("--provider", "--preset", dest="provider", choices=sorted(site_providers.PROVIDERS),
+                   help="oauth: fill endpoints and defaults of a provider (see 'sites providers'); "
+                        "--preset is the old name")
     p.add_argument("--client-json", metavar="FILE",
                    help="oauth: Google client file (client_id, client_secret, redirect_uris[0]); "
                         "without it the client secret is asked on the terminal")
     p.set_defaults(func=_cli_add)
+    p = ssub.add_parser("providers", help="List the OAuth providers (ids for add --provider)")
+    p.set_defaults(func=_cli_providers)
     p = ssub.add_parser("set-key", help="Set the key of an api-key site (from a file, else stdin; never argv)")
     p.add_argument("id")
     p.add_argument("--from-file", metavar="F")

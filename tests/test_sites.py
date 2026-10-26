@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from hermes_app import sites
+from hermes_app import site_providers, sites
 
 SECRET = "s3cr3t-cookie-value"
 UA = "Mozilla/5.0 (iPhone) Version/18.0 Mobile/15E148 Safari/604.1"
@@ -213,7 +213,7 @@ def test_views_have_no_cookie_values(env):
     for view in (sites.get("yt"), sites.list_sites()[0], sites.check("yt")):
         assert SECRET not in json.dumps(view)
         assert set(view) == {"id", "name", "kind", "login_url", "check_domain", "has_secret", "status",
-                             "checked_at", "saved_at", "detail", "check_url", "marker"}
+                             "checked_at", "saved_at", "detail", "check_url", "marker", "provider", "flows"}
         assert view["kind"] == "cookie" and view["has_secret"] is True
     assert sites.get("yt")["check_domain"] == "127.0.0.1"
 
@@ -359,8 +359,7 @@ CLIENT_SECRET = "cl13nt-s3cr3t"
 @pytest.fixture
 def oauth_stub(monkeypatch):
     mod = types.ModuleType("hermes_app.site_oauth")
-    mod.GOOGLE = {"auth_url": "https://accounts.example.com/auth", "token_url": "https://oauth.example.com/token",
-                  "extra_params": "access_type=offline&prompt=consent", "redirect_uri": "http://localhost"}
+    mod.GOOGLE = dict(site_providers.PROVIDERS["google"]["config"])  # providers own the config now
     mod.calls = []
 
     def refresh(site_id):
@@ -579,7 +578,7 @@ def test_oauth_check_secret_and_view(env, oauth_stub):
         assert "r3fresh-secret" not in text and "acc-secret" not in text
     assert set(v) == {"id", "name", "kind", "login_url", "check_domain", "has_secret", "status", "checked_at",
                       "saved_at", "detail", "auth_url", "token_url", "client_id", "scopes", "redirect_uri",
-                      "has_client_secret"}
+                      "has_client_secret", "provider", "flows", "redirect_param"}
 
 
 def test_views_of_every_kind_have_no_secret_values(env, oauth_stub):
@@ -700,3 +699,106 @@ def test_cli_api_key_flow(env, tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit):
         run("secret", "-h")
     assert "SENSITIVE" in capsys.readouterr().out
+
+
+# --- plan 0009: providers ---------------------------------------------------------------------
+
+EBAY = {"name": "eBay", "provider": "ebay", "client_id": "app-id", "client_secret": CLIENT_SECRET,
+        "redirect_param": "Ru-Name-1"}
+
+
+def test_provider_put_ebay(env):
+    v = sites.put({"id": "ebay", **EBAY, "extra_params": "evil=1", "auth_url": "https://evil.example/a",
+                   "token_auth": "body", "pkce": False, "bogus": "x"})
+    meta = sites._read("ebay")
+    cfg = site_providers.PROVIDERS["ebay"]["config"]
+    assert meta["provider"] == "ebay" and meta["kind"] == "oauth"
+    assert (meta["auth_url"], meta["token_url"]) == (cfg["auth_url"], cfg["token_url"])  # request urls dropped
+    assert (meta["token_auth"], meta["pkce"], meta["refresh_scope"]) == ("basic", True, True)
+    assert meta["extra_params"] is None and "bogus" not in meta
+    assert meta["redirect_param"] == "Ru-Name-1" and meta["redirect_uri"] == "https://localhost/ebay"
+    assert meta["scopes"].startswith("https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.")
+    assert CLIENT_SECRET not in json.dumps(meta) and sites.read_secret("ebay") == {"client_secret": CLIENT_SECRET}
+    assert (v["provider"], v["flows"], v["redirect_param"]) == ("ebay", ["safari"], "Ru-Name-1")
+    assert "token_auth" not in v and CLIENT_SECRET not in json.dumps(v)
+    # update keeps the credentials and the config
+    sites.put({"id": "ebay", "name": "eBay", "provider": "ebay", "client_id": "app-id", "redirect_param": "Ru-Name-1"})
+    assert sites.read_secret("ebay") == {"client_secret": CLIENT_SECRET}
+
+
+@pytest.mark.parametrize("extra", [{"redirect_param": ""}, {"redirect_param": "a\nb"}, {"redirect_param": "x" * 257},
+                                   {"client_id": ""}, {"provider": "nope"}])
+def test_provider_put_rejects_bad_input(env, extra):
+    with pytest.raises(ValueError):
+        sites.put({"id": "ebay", **{**EBAY, **extra}})
+    assert sites.get("ebay") is None
+
+
+def test_redirect_param_only_via_provider_or_cli(env, oauth_stub):
+    custom = {"id": "c", "name": "C", "kind": "oauth", "auth_url": "https://e.com/a", "token_url": "https://e.com/t",
+              "client_id": "c", "redirect_uri": "http://localhost"}
+    sites.put({**custom, "redirect_param": "RuName", "token_auth": "basic", "pkce": False})
+    meta = sites._read("c")
+    assert not {"redirect_param", "token_auth", "pkce", "refresh_scope", "provider"} & set(meta)
+    # Google lists no redirect_param: dropped
+    sites.put({"id": "g", "name": "G", "provider": "google", "client_id": "cid", "redirect_param": "x"})
+    assert "redirect_param" not in sites._read("g")
+    # the CLI path may set it
+    assert sites.put({**custom, "redirect_param": "RuName"}, local=True)["redirect_param"] == "RuName"
+    # and an update through the app keeps it
+    sites.put({**custom, "name": "C2"})
+    assert sites._read("c")["redirect_param"] == "RuName"
+
+
+def test_preset_alias_equals_provider_google_and_is_byte_compatible(env, oauth_stub):
+    body = {"name": "YT", "client_id": "cid", "client_secret": CLIENT_SECRET, "scopes": "a b"}
+    sites.put({"id": "pv", **body, "provider": "google"})
+    sites.put({"id": "ps", **body, "preset": "google"})
+    pv, ps = sites._read("pv"), sites._read("ps")
+    assert pv["provider"] == ps["provider"] == "google"
+    strip = lambda m: {k: v for k, v in m.items() if k not in ("id", "name", "saved_at", "checked_at")}
+    assert strip(pv) == strip(ps)
+    # what 2.1.0 wrote for a Google preset, key for key (plus "provider" and nothing else)
+    assert list(pv) == ["status", "checked_at", "saved_at", "detail", "misses", "notified", "user_agent",
+                        "id", "name", "kind", "extra_params", "auth_url", "token_url", "client_id", "scopes",
+                        "redirect_uri", "provider"]
+    assert pv["extra_params"] == "access_type=offline&prompt=consent" and pv["redirect_uri"] == "http://localhost"
+    assert pv["auth_url"] == "https://accounts.google.com/o/oauth2/v2/auth"
+    # switching an existing site to another provider keeps nothing of the first
+    sites.put({"id": "pv", **EBAY})
+    assert sites._read("pv")["provider"] == "ebay" and sites._read("pv")["scopes"].startswith("https://api.ebay.com/")
+
+
+def test_views_carry_provider_and_flows(env):
+    env.add()
+    v = sites.get("yt")
+    assert v["provider"] is None and v["flows"] is None
+    sites.put({"id": "ebay", **EBAY})
+    assert [x["flows"] for x in sites.list_sites() if x["id"] == "ebay"] == [["safari"]]
+
+
+def test_public_list_hides_config():
+    out = site_providers.public_list()
+    assert [p["id"] for p in out] == ["google", "ebay"]
+    for p in out:
+        assert set(p) == {"id", "name", "kind", "help", "flows", "fields"}
+        assert all(f["key"] in site_providers.FIELD_KEYS for f in p["fields"])
+    assert "token_url" not in json.dumps(out)
+
+
+def test_cli_provider_flag_alias_redirect_param_and_list(env, capsys):
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    sites.setup_cli(parser.add_subparsers())
+    args = parser.parse_args(["sites", "add", "ebay", "--name", "eBay", "--provider", "ebay", "--client-id", "app",
+                              "--redirect-param", "Ru-Name-9"])
+    assert args.func(args) == 0
+    v = sites.get("ebay")
+    assert (v["provider"], v["redirect_param"], v["client_id"]) == ("ebay", "Ru-Name-9", "app")
+    args = parser.parse_args(["sites", "add", "g", "--name", "G", "--preset", "google", "--client-id", "c"])
+    assert args.func(args) == 0 and sites.get("g")["provider"] == "google"
+    capsys.readouterr()
+    args = parser.parse_args(["sites", "providers"])
+    assert args.func(args) == 0
+    assert capsys.readouterr().out.splitlines() == ["google\tGoogle", "ebay\teBay"]

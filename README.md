@@ -27,12 +27,25 @@ hermes gateway restart
 All routes live on the API server's own port (default 8642) and need the same
 `Authorization: Bearer $API_SERVER_KEY` as the rest of the API server. Without it they return `401`.
 
-- `GET /app/v1/capabilities`: `{"plugin": "hermes_app", "version": "2.0.0", "features": ["notices", "devices", "upload", "search", "todos"]}`. The app calls this first; a `404` means the plugin is not installed and the app hides the features above.
+- `GET /app/v1/capabilities`: `{"plugin": "hermes_app", "version": "2.3.0", "features": ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "site_providers"]}`. The app calls this first; a `404` means the plugin is not installed and the app hides the features above.
+- `GET /app/v1/sites/providers`: `{"providers": [{"id", "name", "kind", "help", "flows", "fields"}]}`, the OAuth providers the host knows (`google`, `ebay`); `fields[]` is `{key, label, secret?, required?, default?}`. The server-only endpoints and switches are never served. Announced by the `site_providers` feature.
+- `POST /app/v1/sites`: add or update a site. For OAuth, `provider` (`google`, `ebay`) fills the endpoints and defaults; `preset: "google"` is the old name and stays an alias. With a provider only its `fields` keys (`client_id`, `client_secret`, `scopes`, `redirect_uri`, `redirect_param`) are read from the body. A site with `redirect_param` (eBay RuName) signs in with Safari only; host login answers `400 {"error": "sign in with Safari for this site"}`.
 - `GET /app/v1/notices?limit=100`: `{"notices": [...]}`, newest first.
 - `POST /app/v1/devices`: `{token, environment?, kind?}`. `environment` is `production` (default) or `sandbox`; `kind: "widget"` stores the token in `widget_devices.json`, apart from the alert devices. The plugin only stores tokens; it sends no push.
 - `POST /app/v1/upload`: raw file body with `Content-Type` and `X-Filename` (percent-encoded), up to 10 MB (the API server's body limit; `413` above). Stores `~/.hermes/uploads/<YYYY-MM-DD>/<8 hex>-<name>` and returns `201 {"path", "name", "size", "mime"}`. `path` is absolute and goes into the run input for the vision or file tools.
 - `GET /app/v1/search?q=&limit=30`: full-text match over user and assistant messages, limit at most 50. Returns `{"hits": [{"session_id", "session_title", "message_id", "role", "snippet", "timestamp"}]}`. The snippet marks matches with `**`. Queries under 2 characters give `{"hits": []}`.
 - `GET /app/v1/todos?session_id=`: the agent's latest todo list for a session, kept in memory by the `post_tool_call` hook (lost on restart). `200 {"session_id", "todos"}`, `404 {"error": "no plan"}`, `400` without `session_id`.
+
+## Site providers (CLI)
+
+```sh
+hermes app sites providers                       # ids and names
+hermes app sites add ebay --name eBay --provider ebay --client-id APP_ID --redirect-param RUNAME
+```
+
+`--provider` replaces `--preset`, which still works. `--redirect-param` is the value sent as
+`redirect_uri` when a provider registers a name instead of a URL (eBay RuName); the address you paste
+back is matched against `--redirect-uri`. The client secret is asked on the terminal.
 
 ## Events for push providers
 
@@ -78,6 +91,7 @@ What a user should know before installing (Hermes catalog rule 13):
 - `__init__.py`: exports `register(ctx)`.
 - `adapter.py`: platform adapter (`send()`), event emit, `register(ctx)`.
 - `routes.py`: the `/app/v1` routes and their auth wrapper.
+- `sites.py`, `site_oauth.py`, `site_providers.py`: site logins, the OAuth flow, the provider table.
 - `pair.py`: `hermes app pair`.
 - `store.py`: notice classifier, JSONL notice store, device lists.
 - `upload.py`, `search.py`, `todos.py`: upload storage, search query, todo list hook.

@@ -15,13 +15,13 @@ from typing import Optional
 
 from aiohttp import web
 
-from . import host_browser, search, site_oauth, sites, store, todos, upload
+from . import host_browser, search, site_oauth, site_providers, sites, store, todos, upload
 
 logger = logging.getLogger(__name__)
 
 PLUGIN = "hermes_app"
-VERSION = "2.2.1"
-FEATURES = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage"]
+VERSION = "2.3.0"
+FEATURES = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "site_providers"]
 PREFIX = "/app/v1"
 KEEPALIVE_KEY = web.AppKey("hermes_app_sites_keepalive", asyncio.Task)  # the keepalive task
 WIRED_KEY = web.AppKey("hermes_app_wired", bool)  # once-per-app guard
@@ -179,6 +179,10 @@ async def post_site(request: web.Request) -> web.Response:
     return web.json_response(view)
 
 
+async def get_site_providers(request: web.Request) -> web.Response:
+    return web.json_response({"providers": site_providers.public_list()})
+
+
 async def delete_site(request: web.Request) -> web.Response:
     if not await asyncio.to_thread(sites.remove, request.match_info["id"]):
         return _unknown()
@@ -305,6 +309,8 @@ async def host_login(request: web.Request) -> web.Response:
     kind = view.get("kind") or "cookie"
     if kind not in ("cookie", "oauth"):
         return _bad()
+    if kind == "oauth" and view.get("redirect_param"):  # its redirect is fixed: no loopback listener
+        return web.json_response({"error": "sign in with Safari for this site"}, status=400)
     if not host_browser.available():
         return web.json_response({"error": "host login unavailable"}, status=501)
     try:
@@ -391,6 +397,7 @@ def wire(app: web.Application, adapter) -> None:
         ("GET", "/search", search_messages),
         ("GET", "/todos", get_todos),
         ("GET", "/sites", get_sites),
+        ("GET", "/sites/providers", get_site_providers),
         ("PUT", "/sites/{id}/session", put_site_session),
         ("POST", "/sites/{id}/check", check_site),
         ("POST", "/sites", post_site),
