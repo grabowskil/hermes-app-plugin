@@ -38,11 +38,17 @@ VIEW = {"id": "yt", "name": "YouTube", "login_url": "https://accounts.example.co
         "status": "ok", "checked_at": None, "saved_at": None, "detail": None}
 
 
+OAUTH_VIEW = {**VIEW, "id": "oa", "kind": "oauth", "login_url": None, "redirect_uri": "http://localhost"}
+
+
 class FakeSites:
     """Stands in for ``hermes_app.sites`` (written by another slice)."""
     def __init__(self):
         self.saved = []
         self.started = []
+        self.checked = []
+        self.keys = []
+        self.views = {"yt": VIEW, "oa": OAUTH_VIEW, "ak": {**VIEW, "id": "ak", "kind": "api_key"}}
 
     def list_sites(self):
         return [VIEW]
@@ -59,6 +65,26 @@ class FakeSites:
 
     def check(self, site_id):
         self._known(site_id)
+        self.checked.append(site_id)
+        return VIEW
+
+    def get(self, site_id):
+        return self.views.get(site_id)
+
+    def put(self, fields):
+        if not fields.get("name"):
+            raise ValueError("bad")
+        return {**VIEW, "name": fields["name"]}
+
+    def remove(self, site_id):
+        return site_id == "yt"
+
+    def set_api_key(self, site_id, key):
+        if site_id != "yt":
+            raise KeyError(site_id)
+        if not key:
+            raise ValueError("bad")
+        self.keys.append((site_id, key))
         return VIEW
 
     async def keepalive(self, publish):
@@ -69,8 +95,67 @@ class FakeSites:
 @pytest.fixture(autouse=True)
 def fake_sites(monkeypatch):
     fake = FakeSites()
-    for name in ("list_sites", "save_session", "check", "keepalive"):
+    for name in ("list_sites", "save_session", "check", "keepalive", "get", "put", "remove", "set_api_key"):
         monkeypatch.setattr(routes.sites, name, getattr(fake, name), raising=False)
+    return fake
+
+
+class FakeOAuth:
+    def __init__(self):
+        self.finished = []
+
+    def start(self, site_id):
+        return {"auth_url": "https://auth.example.com/?state=x", "redirect_uri": "http://localhost"}
+
+    def finish(self, site_id, redirect_url):
+        if "code=" not in redirect_url:
+            raise ValueError("secret detail")
+        self.finished.append((site_id, redirect_url))
+
+    def matches_redirect(self, url, redirect_uri):
+        return url.startswith(redirect_uri)
+
+
+class FakeBrowser:
+    def __init__(self, is_available=True, urls=()):
+        self.is_available = is_available
+        self.urls = list(urls)
+        self.started = []
+        self.closed = []
+
+    def available(self):
+        return self.is_available
+
+    async def start(self, site_id, url):
+        self.started.append((site_id, url))
+
+    async def cookies(self, site_id):
+        return [{"name": "SID", "value": SECRET}]
+
+    async def page_urls(self, site_id):
+        return self.urls
+
+    async def user_agent(self, site_id):
+        return "UA"
+
+    async def close(self, site_id):
+        self.closed.append(site_id)
+
+    async def close_all(self):
+        self.closed.append("*")
+
+
+@pytest.fixture(autouse=True)
+def fake_oauth(monkeypatch):
+    fake = FakeOAuth()
+    monkeypatch.setattr(routes, "site_oauth", fake)
+    return fake
+
+
+@pytest.fixture(autouse=True)
+def fake_browser(monkeypatch):
+    fake = FakeBrowser()
+    monkeypatch.setattr(routes, "host_browser", fake)
     return fake
 
 
@@ -89,7 +174,10 @@ def test_every_route_needs_the_key():
         out = []
         for method, path in (("GET", "/capabilities"), ("GET", "/notices"), ("POST", "/devices"),
                              ("POST", "/upload"), ("GET", "/search?q=hello"), ("GET", "/todos?session_id=s"), ("GET", "/sites"),
-                             ("PUT", "/sites/yt/session"), ("POST", "/sites/yt/check")):
+                             ("PUT", "/sites/yt/session"), ("POST", "/sites/yt/check"), ("POST", "/sites"),
+                             ("DELETE", "/sites/yt"), ("PUT", "/sites/yt/api-key"), ("POST", "/sites/yt/oauth/start"),
+                             ("POST", "/sites/yt/oauth/finish"), ("POST", "/sites/yt/host-login"),
+                             ("POST", "/sites/yt/host-login/finish")):
             out.append((await c.request(method, "/app/v1" + path)).status)
             out.append((await c.request(method, "/app/v1" + path, headers={"Authorization": "Bearer nope"})).status)
         return out
@@ -116,13 +204,15 @@ def test_no_key_configured_refuses():
     assert _run(go, NoKey()) == 401
 
 
-def test_capabilities():
+def test_capabilities(fake_browser):
     async def go(c):
         r = await c.get("/app/v1/capabilities", headers=AUTH)
         return r.status, await r.json()
 
-    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.1.0",
-                              "features": ["notices", "devices", "upload", "search", "todos", "sites"]})
+    base = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage"]
+    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.2.0", "features": base + ["host_login"]})
+    fake_browser.is_available = False
+    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.2.0", "features": base})
 
 
 def test_version_matches_manifest():
@@ -290,3 +380,100 @@ def test_publish_stores_and_emits(monkeypatch):
     adapter.publish(notice)
     assert events == [("notice", notice)]
     assert store.latest(1)[0]["id"] == notice["id"]
+
+
+def test_site_manage_routes(fake_sites):
+    async def go(c):
+        add = await c.post("/app/v1/sites", json={"name": "Mine"}, headers=AUTH)
+        add_bad = await c.post("/app/v1/sites", json={}, headers=AUTH)
+        add_junk = await c.post("/app/v1/sites", data="nope", headers=AUTH)
+        rm = await c.delete("/app/v1/sites/yt", headers=AUTH)
+        rm_none = await c.delete("/app/v1/sites/nope", headers=AUTH)
+        key = await c.put("/app/v1/sites/yt/api-key", json={"key": "K"}, headers=AUTH)
+        key_none = await c.put("/app/v1/sites/nope/api-key", json={"key": "K"}, headers=AUTH)
+        key_bad = await c.put("/app/v1/sites/yt/api-key", json={"key": ""}, headers=AUTH)
+        key_missing = await c.put("/app/v1/sites/yt/api-key", json={}, headers=AUTH)
+        return ((add.status, (await add.json())["name"]), add_bad.status, add_junk.status,
+                (rm.status, await rm.json()), rm_none.status, key.status, key_none.status, key_bad.status,
+                key_missing.status)
+
+    assert _run(go) == ((200, "Mine"), 400, 400, (200, {"ok": True}), 404, 200, 404, 400, 400)
+    assert fake_sites.keys == [("yt", "K")]
+
+
+def test_oauth_start_and_finish(fake_oauth):
+    async def go(c):
+        start = await c.post("/app/v1/sites/oa/oauth/start", headers=AUTH)
+        ok = await c.post("/app/v1/sites/oa/oauth/finish", json={"redirect_url": "http://localhost/?code=abc"},
+                          headers=AUTH)
+        bad = await c.post("/app/v1/sites/oa/oauth/finish", json={"redirect_url": "http://localhost/?x=1"},
+                           headers=AUTH)
+        return start.status, await start.json(), ok.status, await ok.json(), bad.status, await bad.text()
+
+    start, start_body, ok, ok_body, bad, bad_text = _run(go)
+    assert (start, start_body) == (200, {"auth_url": "https://auth.example.com/?state=x",
+                                         "redirect_uri": "http://localhost"})
+    assert (ok, ok_body) == (200, OAUTH_VIEW)
+    assert bad == 400 and "secret detail" not in bad_text and "x=1" not in bad_text
+    assert fake_oauth.finished == [("oa", "http://localhost/?code=abc")]
+
+
+def test_host_login_unavailable_and_wrong_kind(fake_browser):
+    async def go(c):
+        ak = await c.post("/app/v1/sites/ak/host-login", headers=AUTH)
+        fake_browser.is_available = False
+        off = await c.post("/app/v1/sites/yt/host-login", headers=AUTH)
+        return ak.status, off.status
+
+    assert _run(go) == (400, 501)
+    assert fake_browser.started == []
+
+
+def test_host_login_starts_browser(fake_browser):
+    async def go(c):
+        cookie = await c.post("/app/v1/sites/yt/host-login", headers=AUTH)
+        oauth = await c.post("/app/v1/sites/oa/host-login", headers=AUTH)
+        return cookie.status, await cookie.json(), oauth.status
+
+    assert _run(go) == (200, {"ok": True}, 200)
+    assert fake_browser.started == [("yt", VIEW["login_url"]), ("oa", "https://auth.example.com/?state=x")]
+
+
+def test_host_login_finish_cookie(fake_sites, fake_browser):
+    async def go(c):
+        saved = await c.post("/app/v1/sites/yt/host-login/finish", json={"save": True}, headers=AUTH)
+        text = await saved.text()
+        dropped = await c.post("/app/v1/sites/yt/host-login/finish", json={"save": False}, headers=AUTH)
+        return saved.status, text, dropped.status
+
+    status, text, dropped = _run(go)
+    assert (status, dropped) == (200, 200)
+    assert json.loads(text) == VIEW and SECRET not in text
+    assert fake_sites.saved == [("yt", [{"name": "SID", "value": SECRET}], "UA")]
+    assert fake_sites.checked == ["yt"]
+    assert fake_browser.closed == ["yt", "yt", "*"]
+
+
+def test_host_login_finish_oauth(fake_oauth, fake_browser):
+    fake_browser.urls = ["https://auth.example.com/consent", "http://localhost/?code=abc", "http://localhost/?code=zzz"]
+
+    async def go(c):
+        ok = await c.post("/app/v1/sites/oa/host-login/finish", json={"save": True}, headers=AUTH)
+        fake_browser.urls = ["https://auth.example.com/consent"]
+        unfinished = await c.post("/app/v1/sites/oa/host-login/finish", json={"save": True}, headers=AUTH)
+        return ok.status, unfinished.status
+
+    assert _run(go) == (200, 400)
+    assert fake_oauth.finished == [("oa", "http://localhost/?code=abc")]
+    assert fake_browser.closed == ["oa", "oa", "*"]
+
+
+def test_cleanup_closes_host_browser(fake_browser):
+    async def main():
+        app = web.Application()
+        routes.wire(app, FakeAdapter())
+        async with TestClient(TestServer(app)):
+            pass
+
+    asyncio.run(main())
+    assert fake_browser.closed == ["*"]

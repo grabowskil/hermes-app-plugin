@@ -15,13 +15,13 @@ from typing import Optional
 
 from aiohttp import web
 
-from . import search, sites, store, todos, upload
+from . import host_browser, search, site_oauth, sites, store, todos, upload
 
 logger = logging.getLogger(__name__)
 
 PLUGIN = "hermes_app"
-VERSION = "2.1.0"
-FEATURES = ["notices", "devices", "upload", "search", "todos", "sites"]
+VERSION = "2.2.0"
+FEATURES = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage"]
 PREFIX = "/app/v1"
 KEEPALIVE_KEY = web.AppKey("hermes_app_sites_keepalive", asyncio.Task)  # the keepalive task
 WIRED_KEY = web.AppKey("hermes_app_wired", bool)  # once-per-app guard
@@ -55,7 +55,8 @@ def _authed(adapter, handler):
 
 
 async def capabilities(request: web.Request) -> web.Response:
-    return web.json_response({"plugin": PLUGIN, "version": VERSION, "features": FEATURES})
+    features = FEATURES + (["host_login"] if host_browser.available() else [])
+    return web.json_response({"plugin": PLUGIN, "version": VERSION, "features": features})
 
 
 async def notices(request: web.Request) -> web.Response:
@@ -147,6 +148,149 @@ async def check_site(request: web.Request) -> web.Response:
     return web.json_response(view)
 
 
+def _bad() -> web.Response:
+    return web.json_response({"error": "bad request"}, status=400)
+
+
+def _unknown() -> web.Response:
+    return web.json_response({"error": "unknown site"}, status=404)
+
+
+async def _body(request: web.Request) -> dict:
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise ValueError
+    return body
+
+
+async def _view(site_id: str) -> Optional[dict]:
+    return await asyncio.to_thread(sites.get, site_id)
+
+
+async def post_site(request: web.Request) -> web.Response:
+    try:
+        fields = await _body(request)
+    except Exception:
+        return _bad()
+    try:
+        view = await asyncio.to_thread(sites.put, fields)
+    except ValueError:
+        return _bad()
+    return web.json_response(view)
+
+
+async def delete_site(request: web.Request) -> web.Response:
+    if not await asyncio.to_thread(sites.remove, request.match_info["id"]):
+        return _unknown()
+    return web.json_response({"ok": True})
+
+
+async def put_api_key(request: web.Request) -> web.Response:
+    try:
+        key = (await _body(request))["key"]
+        if not isinstance(key, str):
+            raise ValueError
+    except Exception:
+        return _bad()
+    try:
+        await asyncio.to_thread(sites.set_api_key, request.match_info["id"], key)
+        view = await asyncio.to_thread(sites.check, request.match_info["id"])
+    except KeyError:
+        return _unknown()
+    except ValueError:
+        return _bad()
+    return web.json_response(view)
+
+
+async def oauth_start(request: web.Request) -> web.Response:
+    try:
+        started = await asyncio.to_thread(site_oauth.start, request.match_info["id"])
+    except KeyError:
+        return _unknown()
+    except ValueError:
+        return _bad()
+    return web.json_response({"auth_url": started["auth_url"], "redirect_uri": started["redirect_uri"]})
+
+
+async def oauth_finish(request: web.Request) -> web.Response:
+    site_id = request.match_info["id"]
+    try:
+        redirect_url = (await _body(request))["redirect_url"]
+        if not isinstance(redirect_url, str):
+            raise ValueError
+    except Exception:
+        return _bad()
+    try:
+        await asyncio.to_thread(site_oauth.finish, site_id, redirect_url)
+    except KeyError:
+        return _unknown()
+    except ValueError:
+        return web.json_response({"error": "login failed"}, status=400)
+    view = await _view(site_id)
+    return web.json_response(view) if view is not None else _unknown()
+
+
+async def host_login(request: web.Request) -> web.Response:
+    site_id = request.match_info["id"]
+    view = await _view(site_id)
+    if view is None:
+        return _unknown()
+    kind = view.get("kind") or "cookie"
+    if kind not in ("cookie", "oauth"):
+        return _bad()
+    if not host_browser.available():
+        return web.json_response({"error": "host login unavailable"}, status=501)
+    try:
+        if kind == "oauth":
+            url = (await asyncio.to_thread(site_oauth.start, site_id))["auth_url"]
+        else:
+            url = view.get("login_url")
+        if not url:
+            return _bad()
+        await host_browser.start(site_id, url)
+    except KeyError:
+        return _unknown()
+    except ValueError:
+        return _bad()
+    return web.json_response({"ok": True})
+
+
+async def host_login_finish(request: web.Request) -> web.Response:
+    site_id = request.match_info["id"]
+    try:
+        save = bool((await _body(request)).get("save"))
+    except Exception:
+        return _bad()
+    view = await _view(site_id)
+    if view is None:
+        return _unknown()
+    try:
+        if save:
+            if (view.get("kind") or "cookie") == "oauth":
+                urls = await host_browser.page_urls(site_id)
+                match = next((u for u in urls if site_oauth.matches_redirect(u, view.get("redirect_uri") or "")), None)
+                if match is None:
+                    return web.json_response({"error": "login not finished"}, status=400)
+                try:
+                    await asyncio.to_thread(site_oauth.finish, site_id, match)
+                except ValueError:
+                    return web.json_response({"error": "login failed"}, status=400)
+            else:
+                cookies = await host_browser.cookies(site_id)
+                user_agent = await host_browser.user_agent(site_id)
+                try:
+                    await asyncio.to_thread(sites.save_session, site_id, cookies, user_agent)
+                except ValueError:
+                    return web.json_response({"error": "login not finished"}, status=400)
+                await asyncio.to_thread(sites.check, site_id)
+    except KeyError:
+        return _unknown()
+    finally:
+        await host_browser.close(site_id)
+    view = await _view(site_id)
+    return web.json_response(view) if view is not None else _unknown()
+
+
 def _start_keepalive(publish):
     async def start(app: web.Application) -> None:
         app[KEEPALIVE_KEY] = asyncio.create_task(sites.keepalive(publish))
@@ -156,6 +300,7 @@ def _start_keepalive(publish):
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        await host_browser.close_all()
 
     return start, stop
 
@@ -174,6 +319,13 @@ def wire(app: web.Application, adapter) -> None:
         ("GET", "/sites", get_sites),
         ("PUT", "/sites/{id}/session", put_site_session),
         ("POST", "/sites/{id}/check", check_site),
+        ("POST", "/sites", post_site),
+        ("DELETE", "/sites/{id}", delete_site),
+        ("PUT", "/sites/{id}/api-key", put_api_key),
+        ("POST", "/sites/{id}/oauth/start", oauth_start),
+        ("POST", "/sites/{id}/oauth/finish", oauth_finish),
+        ("POST", "/sites/{id}/host-login", host_login),
+        ("POST", "/sites/{id}/host-login/finish", host_login_finish),
     ):
         app.router.add_route(method, PREFIX + path, _authed(adapter, handler))
     if WIRED_KEY not in app:

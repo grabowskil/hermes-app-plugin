@@ -2,7 +2,9 @@ import asyncio
 import json
 import os
 import stat
+import sys
 import threading
+import types
 from http.cookiejar import MozillaCookieJar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -38,12 +40,16 @@ def cookie(name="sid", value=SECRET, domain="127.0.0.1", expires=None, **kw):
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_APP_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(sites, "_ALLOW_HTTP", True)
-    state = {"status": 200, "body": b"hello LOGGED-IN", "set_cookie": None, "seen": []}
+    state = {"status": 200, "body": b"hello LOGGED-IN", "set_cookie": None, "location": None,
+             "seen": [], "auth": []}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             state["seen"].append({"cookie": self.headers.get("Cookie"), "ua": self.headers.get("User-Agent")})
+            state["auth"].append(self.headers.get("Authorization"))
             self.send_response(state["status"])
+            if state["location"]:
+                self.send_header("Location", state["location"])
             if state["set_cookie"]:
                 self.send_header("Set-Cookie", state["set_cookie"])
             self.send_header("Content-Length", str(len(state["body"])))
@@ -206,8 +212,9 @@ def test_views_have_no_cookie_values(env):
     sites.check("yt")
     for view in (sites.get("yt"), sites.list_sites()[0], sites.check("yt")):
         assert SECRET not in json.dumps(view)
-        assert set(view) == {"id", "name", "login_url", "check_domain", "status", "checked_at",
-                             "saved_at", "detail"}
+        assert set(view) == {"id", "name", "kind", "login_url", "check_domain", "has_secret", "status",
+                             "checked_at", "saved_at", "detail", "check_url", "marker"}
+        assert view["kind"] == "cookie" and view["has_secret"] is True
     assert sites.get("yt")["check_domain"] == "127.0.0.1"
 
 
@@ -335,9 +342,354 @@ def test_cli(env, capsys):
     assert args.func(args) == 0
     args = parser.parse_args(["sites", "list"])
     assert args.func(args) == 0
-    assert "yt\tmissing\tYouTube" in capsys.readouterr().out
+    assert "yt\tmissing\tYouTube\t127.0.0.1\tcookie" in capsys.readouterr().out
     args = parser.parse_args(["sites", "path", "yt"])
     assert args.func(args) == 0
     assert capsys.readouterr().out.strip().endswith("sites/yt/cookies.txt")
     args = parser.parse_args(["sites", "path", "nope"])
     assert args.func(args) == 1
+
+
+# --- plan 0008: api key and oauth kinds -------------------------------------------------------
+
+KEY = "k3y-secret-value"
+CLIENT_SECRET = "cl13nt-s3cr3t"
+
+
+@pytest.fixture
+def oauth_stub(monkeypatch):
+    mod = types.ModuleType("hermes_app.site_oauth")
+    mod.GOOGLE = {"auth_url": "https://accounts.example.com/auth", "token_url": "https://oauth.example.com/token",
+                  "extra_params": "access_type=offline&prompt=consent", "redirect_uri": "http://localhost"}
+    mod.calls = []
+
+    def refresh(site_id):
+        mod.calls.append(site_id)
+        with sites._locked(site_id):
+            meta = sites._read(site_id)
+            meta.update(status="ok", detail=None, checked_at=sites._now())
+            sites._store(site_id, meta)
+        return "ok"
+
+    mod.refresh = refresh
+    mod.access_token = lambda site_id: "access-" + site_id
+    monkeypatch.setitem(sys.modules, "hermes_app.site_oauth", mod)
+    return mod
+
+
+def add_key_site(env, site_id="api", with_check=True, **kw):
+    fields = {"id": site_id, "name": "Api " + site_id, "kind": "api_key", **kw}
+    if with_check:
+        fields.setdefault("check_url", env.url)
+    return sites.put(fields)
+
+
+def test_api_key_ok_sends_header_and_stores_key_privately(env):
+    v = add_key_site(env)
+    assert v["status"] == "missing" and v["has_secret"] is False
+    v = sites.set_api_key("api", f"  {KEY}\n")
+    assert v["has_secret"] is True and KEY not in json.dumps(v)
+    assert stat.S_IMODE((sites._dir("api") / "secret.json").stat().st_mode) == 0o600
+    assert sites.secret("api") == KEY
+    v = sites.check("api")
+    assert v["status"] == "ok" and v["detail"] is None and v["checked_at"]
+    assert env.state["auth"][-1] == f"Bearer {KEY}"
+
+
+def test_api_key_custom_header_and_prefix(env):
+    add_key_site(env, header="X-Api-Key", prefix="")
+    sites.set_api_key("api", KEY)
+    assert sites.check("api")["status"] == "ok"
+    assert env.state["auth"][-1] is None  # not sent as Authorization
+
+
+@pytest.mark.parametrize("code", [401, 403])
+def test_api_key_rejected_is_expired_at_once(env, code):
+    add_key_site(env)
+    sites.set_api_key("api", KEY)
+    env.state["status"] = code
+    v = sites.check("api")
+    assert v["status"] == "expired" and v["detail"] == f"HTTP {code}"
+    assert [n["title"] for n in sites.due_notices()] == ["Login expired: Api api"]
+    env.state["status"] = 200
+    assert sites.check("api")["status"] == "ok"
+
+
+def test_api_key_server_error_is_error(env):
+    add_key_site(env)
+    sites.set_api_key("api", KEY)
+    env.state["status"] = 503
+    v = sites.check("api")
+    assert v["status"] == "error" and v["detail"] == "HTTP 503"
+
+
+def test_api_key_redirect_is_not_followed(env):
+    add_key_site(env)
+    sites.set_api_key("api", KEY)
+    env.state.update(status=302, location=env.url.replace("/check", "/elsewhere"))
+    v = sites.check("api")
+    assert v["status"] == "error" and v["detail"] == "redirect not followed"
+    assert len(env.state["seen"]) == 1 and len(env.state["auth"]) == 1  # the key was sent exactly once
+
+
+def test_api_key_without_check_url_is_ok_not_checked(env):
+    add_key_site(env, with_check=False)
+    v = sites.set_api_key("api", KEY)
+    assert v["status"] == "ok" and v["detail"] == "not checked" and v["check_domain"] is None
+    v = sites.check("api")
+    assert v["status"] == "ok" and v["detail"] == "not checked"
+    assert env.state["seen"] == []
+
+
+def test_api_key_check_without_key_makes_no_request(env):
+    add_key_site(env)
+    assert sites.check("api")["status"] == "missing"
+    assert env.state["seen"] == []
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "a\nb", "k\u00e9y", "x" * 5000, None])
+def test_set_api_key_validation(env, bad):
+    add_key_site(env)
+    with pytest.raises(ValueError):
+        sites.set_api_key("api", bad)
+    with pytest.raises(KeyError):
+        sites.set_api_key("nope", KEY)
+    env.add("cook")
+    with pytest.raises(ValueError):
+        sites.set_api_key("cook", KEY)
+    assert sites.get("api")["has_secret"] is False
+
+
+def test_put_slug_defaults_and_update(env):
+    v = sites.put({"name": "My Cool API!", "kind": "api-key"})
+    assert v["id"] == "my-cool-api" and v["kind"] == "api_key"
+    assert v["header"] == "Authorization" and v["prefix"] == "Bearer " and v["check_url"] is None
+    with pytest.raises(ValueError):
+        sites.put({"name": "!!!"})
+    v = sites.put({"id": "my-cool-api", "name": "Renamed", "check_url": env.url})
+    assert v["name"] == "Renamed" and v["check_url"] == env.url and v["header"] == "Authorization"
+    assert len(sites.list_sites()) == 1
+
+
+@pytest.mark.parametrize("fields", [
+    {"name": "A", "kind": "bogus"},
+    {"name": "A", "kind": "api_key", "header": "Bad Header"},
+    {"name": "A", "kind": "api_key", "check_url": "http://insecure.example.com/x"},
+    {"name": "A", "kind": "api_key", "prefix": "a\nb"},
+    {"name": "A", "kind": "api_key", "client_secret": "x"},
+    {"name": "A", "kind": "cookie", "login_url": "https://e.com/l", "check_url": "https://e.com/c"},  # no marker
+    {"name": "A", "kind": "oauth", "auth_url": "https://e.com/a", "token_url": "https://e.com/t", "client_id": "c",
+     "redirect_uri": "http://evil.example.com/cb"},
+    {"name": "A", "kind": "oauth", "auth_url": "http://e.com/a", "token_url": "https://e.com/t", "client_id": "c",
+     "redirect_uri": "http://localhost"},
+    {"name": "A", "kind": "oauth", "auth_url": "https://e.com/a", "token_url": "https://e.com/t", "client_id": "",
+     "redirect_uri": "http://localhost"},
+    {"name": "A", "kind": "oauth", "preset": "nope"},
+    {"name": "A", "kind": "api_key", "preset": "google"},
+    {"name": "x" * 65},
+    "not a dict",
+])
+def test_put_rejects_bad_fields_and_leaves_nothing(env, monkeypatch, fields):
+    monkeypatch.setattr(sites, "_ALLOW_HTTP", False)
+    with pytest.raises(ValueError):
+        sites.put(fields)
+    assert sites.list_sites() == []
+    assert not (sites._data_dir() / "sites" / "a").exists()
+
+
+def test_put_host_change_drops_credentials(env):
+    add_key_site(env, check_url="https://api.example.com/v1/me")
+    sites.set_api_key("api", KEY)
+    # same host: key kept, fields updated
+    v = sites.put({"id": "api", "name": "Api", "check_url": "https://api.example.com/v2/me"})
+    assert v["has_secret"] is True and v["check_url"].endswith("/v2/me")
+    # new host: key dropped
+    v = sites.put({"id": "api", "name": "Api", "check_url": "https://other.example.org/me"})
+    assert v["has_secret"] is False and v["status"] == "missing"
+    assert not (sites._dir("api") / "secret.json").exists()
+
+
+def test_put_first_check_url_keeps_key_and_kind_change_drops_it(env):
+    add_key_site(env, with_check=False)
+    sites.set_api_key("api", KEY)
+    v = sites.put({"id": "api", "name": "Api", "check_url": env.url})
+    assert v["has_secret"] is True
+    v = sites.put({"id": "api", "name": "Api", "kind": "cookie", "login_url": env.url, "check_url": env.url,
+                   "marker": "m"})
+    assert v["kind"] == "cookie" and v["has_secret"] is False
+    assert not (sites._dir("api") / "secret.json").exists()
+
+
+def test_cookie_host_change_drops_cookies_and_pending(env):
+    env.add()
+    env.login()
+    (sites._dir("yt") / "pending.json").write_text("{}")
+    sites.put({"id": "yt", "name": "Site yt", "login_url": env.url, "check_url": "http://localhost:1/c",
+               "marker": "LOGGED-IN"})
+    d = sites._dir("yt")
+    assert not (d / "cookies.txt").exists() and not (d / "pending.json").exists()
+
+
+def test_oauth_put_google_preset_and_client_secret(env, oauth_stub):
+    v = sites.put({"id": "gyt", "name": "YouTube API", "preset": "google", "client_id": "cid",
+                   "client_secret": CLIENT_SECRET, "scopes": "a b", "extra_params": "evil=1"})
+    assert v["kind"] == "oauth" and v["auth_url"] == oauth_stub.GOOGLE["auth_url"]
+    assert v["token_url"] == oauth_stub.GOOGLE["token_url"] and v["redirect_uri"] == "http://localhost"
+    assert v["client_id"] == "cid" and v["scopes"] == "a b"
+    assert v["has_client_secret"] is True and v["has_secret"] is False
+    assert sites._read("gyt")["extra_params"] == "access_type=offline&prompt=consent"
+    assert CLIENT_SECRET not in json.dumps(sites._read("gyt"))  # site.json never holds it
+    assert sites.read_secret("gyt") == {"client_secret": CLIENT_SECRET}
+    # updating without a client_secret keeps it; a new token host drops everything
+    sites.put({"id": "gyt", "name": "YouTube API"})
+    assert sites.get("gyt")["has_client_secret"] is True
+    v = sites.put({"id": "gyt", "name": "YouTube API", "token_url": "https://evil.example.net/token"})
+    assert v["has_client_secret"] is False
+
+
+def test_secret_helpers_merge_and_are_private(env):
+    env.add()
+    sites.write_secret("yt", {"a": 1, "b": 2})
+    sites.write_secret("yt", {"b": 3, "c": None})
+    assert sites.read_secret("yt") == {"a": 1, "b": 3}
+    assert stat.S_IMODE((sites._dir("yt") / "secret.json").stat().st_mode) == 0o600
+    assert sites.read_secret("nope") == {} and sites.read_secret("../x") == {}
+    with pytest.raises(KeyError):
+        sites.write_secret("nope", {"a": 1})
+    with pytest.raises(ValueError):
+        sites.secret("yt")  # cookie sites have none
+
+
+def test_oauth_check_secret_and_view(env, oauth_stub):
+    sites.put({"id": "g", "name": "G", "preset": "google", "client_id": "cid"})
+    v = sites.check("g")
+    assert v["status"] == "missing" and oauth_stub.calls == []  # no refresh token yet
+    sites.write_secret("g", {"refresh_token": "r3fresh-secret", "access_token": "acc-secret"})
+    v = sites.check("g")
+    assert oauth_stub.calls == ["g"] and v["status"] == "ok" and v["has_secret"] is True
+    assert sites.secret("g") == "access-g"
+    for text in (json.dumps(v), json.dumps(sites.list_sites())):
+        assert "r3fresh-secret" not in text and "acc-secret" not in text
+    assert set(v) == {"id", "name", "kind", "login_url", "check_domain", "has_secret", "status", "checked_at",
+                      "saved_at", "detail", "auth_url", "token_url", "client_id", "scopes", "redirect_uri",
+                      "has_client_secret"}
+
+
+def test_views_of_every_kind_have_no_secret_values(env, oauth_stub):
+    add_key_site(env)
+    sites.set_api_key("api", KEY)
+    sites.put({"id": "g", "name": "G", "preset": "google", "client_id": "cid", "client_secret": CLIENT_SECRET})
+    sites.write_secret("g", {"refresh_token": "rt-secret"})
+    env.add()
+    env.login()
+    dump = json.dumps([sites.list_sites(), sites.check("api"), sites.get("g"), sites.get("yt")])
+    for value in (KEY, CLIENT_SECRET, "rt-secret", SECRET):
+        assert value not in dump
+    assert {v["id"]: v["kind"] for v in sites.list_sites()} == {"api": "api_key", "g": "oauth", "yt": "cookie"}
+
+
+def test_view_tolerates_missing_fields(env):
+    d = sites._dir("legacy")
+    sites._mkdir(d)
+    sites._store("legacy", {"id": "legacy", "name": "Legacy", "kind": "api_key"})
+    v = sites.get("legacy")
+    assert v["login_url"] is None and v["check_domain"] is None and v["status"] == "missing"
+    sites._store("legacy", {"id": "legacy", "name": "Legacy"})  # 0007 site without any urls
+    assert sites.get("legacy")["kind"] == "cookie"
+    assert [s["id"] for s in sites.list_sites()] == ["legacy"]
+
+
+def test_remove(env):
+    env.add()
+    env.login()
+    assert sites.remove("yt") is True
+    assert sites.get("yt") is None and not sites._dir("yt").exists()
+    assert sites.remove("yt") is False and sites.remove("../x") is False
+
+
+def test_due_ids_per_kind(env, oauth_stub):
+    env.add("cook")
+    add_key_site(env, "keyed")
+    add_key_site(env, "nokey")
+    sites.put({"id": "goa", "name": "Goa", "preset": "google", "client_id": "c"})
+    sites.put({"id": "goa2", "name": "Goa2", "preset": "google", "client_id": "c"})
+    assert sites._due_ids() == []  # nothing has a credential
+    env.login("cook")
+    sites.set_api_key("keyed", KEY)
+    sites.write_secret("goa", {"refresh_token": "rt"})
+    sites.write_secret("goa2", {"access_token": "only-access"})  # no refresh token: not due
+    # a status other than ok/error (here: expired) is not checked either
+    with sites._locked("goa2"):
+        meta = sites._read("goa2")
+        meta["status"] = "expired"
+        sites._store("goa2", meta)
+    with sites._locked("goa"):
+        meta = sites._read("goa")
+        meta["status"] = "ok"
+        sites._store("goa", meta)
+    assert sorted(sites._due_ids()) == ["cook", "goa", "keyed"]
+    sites.check("keyed")
+    sites.check("cook")
+    assert sorted(sites._due_ids()) == ["goa"]  # recently checked ones drop out
+
+
+def test_cli_add_oauth_with_client_json_and_secret(env, oauth_stub, tmp_path, capsys):
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    sites.setup_cli(parser.add_subparsers())
+    cj = tmp_path / "client.json"
+    cj.write_text(json.dumps({"installed": {"client_id": "cid.apps", "client_secret": CLIENT_SECRET,
+                                            "redirect_uris": ["http://localhost:8080"]}}))
+    args = parser.parse_args(["sites", "add", "gyt", "--name", "YouTube API", "--preset", "google",
+                              "--scopes", "https://www.googleapis.com/auth/youtube.readonly",
+                              "--client-json", str(cj)])
+    assert args.func(args) == 0
+    out = capsys.readouterr()
+    assert CLIENT_SECRET not in out.out + out.err
+    v = sites.get("gyt")
+    assert v["kind"] == "oauth" and v["client_id"] == "cid.apps" and v["has_client_secret"] is True
+    assert v["redirect_uri"] == "http://localhost:8080"  # the client file wins over the preset
+    assert v["auth_url"] == oauth_stub.GOOGLE["auth_url"]
+    assert sites.read_secret("gyt")["client_secret"] == CLIENT_SECRET
+    # "web" clients work too; a broken file fails without echoing its content
+    cj.write_text(json.dumps({"web": {"client_id": "web.apps", "client_secret": "s"}}))
+    args = parser.parse_args(["sites", "add", "gweb", "--name", "W", "--preset", "google", "--client-json", str(cj)])
+    assert args.func(args) == 0 and sites.get("gweb")["client_id"] == "web.apps"
+    cj.write_text(json.dumps({"other": {"client_secret": CLIENT_SECRET}}))
+    args = parser.parse_args(["sites", "add", "bad", "--name", "B", "--preset", "google", "--client-json", str(cj)])
+    assert args.func(args) == 1
+    assert CLIENT_SECRET not in capsys.readouterr().err and sites.get("bad") is None
+
+
+def test_cli_api_key_flow(env, tmp_path, monkeypatch, capsys):
+    import argparse
+    import io
+
+    parser = argparse.ArgumentParser()
+    sites.setup_cli(parser.add_subparsers())
+
+    def run(*argv):
+        args = parser.parse_args(["sites", *argv])
+        return args.func(args)
+
+    assert run("add", "api", "--name", "Api", "--kind", "api-key", "--check-url", env.url) == 0
+    kf = tmp_path / "key.txt"
+    kf.write_text(KEY + "\n")
+    assert run("set-key", "api", "--from-file", str(kf)) == 0
+    assert run("set-key", "api", "--from-file", str(tmp_path / "missing")) == 1
+    monkeypatch.setattr(sys, "stdin", io.StringIO("from-stdin-key\n"))
+    assert run("set-key", "api") == 0
+    assert sites.secret("api") == "from-stdin-key"
+    assert run("set-key", "nope", "--from-file", str(kf)) == 1
+    capsys.readouterr()
+    assert run("secret", "api") == 0
+    assert capsys.readouterr().out.strip() == "from-stdin-key"
+    assert run("secret", "nope") == 1
+    env.add()
+    assert run("secret", "yt") == 1
+    assert run("remove", "api") == 0 and run("remove", "api") == 1
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run("secret", "-h")
+    assert "SENSITIVE" in capsys.readouterr().out
