@@ -15,14 +15,16 @@ from typing import Optional
 
 from aiohttp import web
 
-from . import search, store, todos, upload
+from . import search, sites, store, todos, upload
 
 logger = logging.getLogger(__name__)
 
 PLUGIN = "hermes_app"
-VERSION = "2.0.0"
-FEATURES = ["notices", "devices", "upload", "search", "todos"]
+VERSION = "2.1.0"
+FEATURES = ["notices", "devices", "upload", "search", "todos", "sites"]
 PREFIX = "/app/v1"
+KEEPALIVE_KEY = web.AppKey("hermes_app_sites_keepalive", asyncio.Task)  # the keepalive task
+WIRED_KEY = web.AppKey("hermes_app_wired", bool)  # once-per-app guard
 
 
 def _unauthorized() -> web.Response:
@@ -115,8 +117,53 @@ async def get_todos(request: web.Request) -> web.Response:
     return web.json_response({"session_id": session_id, "todos": plan})
 
 
+async def get_sites(request: web.Request) -> web.Response:
+    return web.json_response({"sites": await asyncio.to_thread(sites.list_sites)})
+
+
+async def put_site_session(request: web.Request) -> web.Response:
+    site_id = request.match_info["id"]
+    try:
+        body = await request.json()
+        cookies, user_agent = body["cookies"], body["user_agent"]
+        if not isinstance(cookies, list) or not isinstance(user_agent, str):
+            raise ValueError
+    except Exception:
+        return web.json_response({"error": "bad request"}, status=400)
+    try:
+        await asyncio.to_thread(sites.save_session, site_id, cookies, user_agent)
+    except KeyError:
+        return web.json_response({"error": "unknown site"}, status=404)
+    except ValueError:
+        return web.json_response({"error": "bad request"}, status=400)
+    return web.json_response(await asyncio.to_thread(sites.check, site_id))
+
+
+async def check_site(request: web.Request) -> web.Response:
+    try:
+        view = await asyncio.to_thread(sites.check, request.match_info["id"])
+    except KeyError:
+        return web.json_response({"error": "unknown site"}, status=404)
+    return web.json_response(view)
+
+
+def _start_keepalive(publish):
+    async def start(app: web.Application) -> None:
+        app[KEEPALIVE_KEY] = asyncio.create_task(sites.keepalive(publish))
+
+    async def stop(app: web.Application) -> None:
+        task = app.get(KEEPALIVE_KEY)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    return start, stop
+
+
 def wire(app: web.Application, adapter) -> None:
     """Add the ``/app/v1`` routes to the API server's application."""
+    from .adapter import publish  # lazy: adapter imports this module
+
     for method, path, handler in (
         ("GET", "/capabilities", capabilities),
         ("GET", "/notices", notices),
@@ -124,8 +171,16 @@ def wire(app: web.Application, adapter) -> None:
         ("POST", "/upload", upload_file),
         ("GET", "/search", search_messages),
         ("GET", "/todos", get_todos),
+        ("GET", "/sites", get_sites),
+        ("PUT", "/sites/{id}/session", put_site_session),
+        ("POST", "/sites/{id}/check", check_site),
     ):
         app.router.add_route(method, PREFIX + path, _authed(adapter, handler))
+    if WIRED_KEY not in app:
+        app[WIRED_KEY] = True
+        start, stop = _start_keepalive(publish)
+        app.on_startup.append(start)
+        app.on_cleanup.append(stop)
 
 
 def register(ctx) -> None:

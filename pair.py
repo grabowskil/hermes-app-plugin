@@ -10,6 +10,8 @@ import sys
 from typing import Optional
 from urllib.parse import quote
 
+from . import sites
+
 DEFAULT_PORT = "8642"
 
 
@@ -55,6 +57,7 @@ def _setup(parser) -> None:
     pair.add_argument("--url", help="Base URL the app should use (default: http://<host>:8642)")
     pair.add_argument("--name", help="Name shown in the app (default: this host's name)")
     pair.set_defaults(func=_pair)
+    sites.setup_cli(sub)
     parser.set_defaults(func=lambda args: parser.print_help() or 0)
 
 

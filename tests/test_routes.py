@@ -33,6 +33,47 @@ def _isolate(monkeypatch, tmp_path):
     todos._latest.clear()
 
 
+SECRET = "s3cr3t-cookie-value"
+VIEW = {"id": "yt", "name": "YouTube", "login_url": "https://accounts.example.com/", "check_domain": "example.com",
+        "status": "ok", "checked_at": None, "saved_at": None, "detail": None}
+
+
+class FakeSites:
+    """Stands in for ``hermes_app.sites`` (written by another slice)."""
+    def __init__(self):
+        self.saved = []
+        self.started = []
+
+    def list_sites(self):
+        return [VIEW]
+
+    def _known(self, site_id):
+        if site_id != "yt":
+            raise KeyError(site_id)
+
+    def save_session(self, site_id, cookies, user_agent):
+        self._known(site_id)
+        if not cookies:
+            raise ValueError("bad")
+        self.saved.append((site_id, cookies, user_agent))
+
+    def check(self, site_id):
+        self._known(site_id)
+        return VIEW
+
+    async def keepalive(self, publish):
+        self.started.append(publish)
+        await asyncio.Event().wait()
+
+
+@pytest.fixture(autouse=True)
+def fake_sites(monkeypatch):
+    fake = FakeSites()
+    for name in ("list_sites", "save_session", "check", "keepalive"):
+        monkeypatch.setattr(routes.sites, name, getattr(fake, name), raising=False)
+    return fake
+
+
 def _run(coro_fn, adapter_obj=None):
     async def main():
         app = web.Application()
@@ -47,7 +88,8 @@ def test_every_route_needs_the_key():
     async def go(c):
         out = []
         for method, path in (("GET", "/capabilities"), ("GET", "/notices"), ("POST", "/devices"),
-                             ("POST", "/upload"), ("GET", "/search?q=hello"), ("GET", "/todos?session_id=s")):
+                             ("POST", "/upload"), ("GET", "/search?q=hello"), ("GET", "/todos?session_id=s"), ("GET", "/sites"),
+                             ("PUT", "/sites/yt/session"), ("POST", "/sites/yt/check")):
             out.append((await c.request(method, "/app/v1" + path)).status)
             out.append((await c.request(method, "/app/v1" + path, headers={"Authorization": "Bearer nope"})).status)
         return out
@@ -79,8 +121,8 @@ def test_capabilities():
         r = await c.get("/app/v1/capabilities", headers=AUTH)
         return r.status, await r.json()
 
-    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.0.0",
-                              "features": ["notices", "devices", "upload", "search", "todos"]})
+    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.1.0",
+                              "features": ["notices", "devices", "upload", "search", "todos", "sites"]})
 
 
 def test_version_matches_manifest():
@@ -187,4 +229,64 @@ def test_delivery_survives_emit_failure(monkeypatch):
 
     monkeypatch.setattr(adapter, "_ctx", Ctx())
     notice = adapter._deliver("hello")
+    assert store.latest(1)[0]["id"] == notice["id"]
+
+
+def test_sites_list_and_check(fake_sites):
+    async def go(c):
+        listed = await c.get("/app/v1/sites", headers=AUTH)
+        checked = await c.post("/app/v1/sites/yt/check", headers=AUTH)
+        unknown = await c.post("/app/v1/sites/nope/check", headers=AUTH)
+        return listed.status, await listed.json(), checked.status, await checked.json(), unknown.status
+
+    assert _run(go) == (200, {"sites": [VIEW]}, 200, VIEW, 404)
+
+
+def test_sites_put_session(fake_sites):
+    cookie = {"name": "SID", "value": SECRET, "domain": ".example.com", "path": "/", "expires": None,
+              "secure": True, "http_only": True}
+
+    async def go(c):
+        ok = await c.put("/app/v1/sites/yt/session", json={"cookies": [cookie], "user_agent": "UA"}, headers=AUTH)
+        ok_text = await ok.text()
+        unknown = await c.put("/app/v1/sites/nope/session", json={"cookies": [cookie], "user_agent": "UA"}, headers=AUTH)
+        empty = await c.put("/app/v1/sites/yt/session", json={"cookies": [], "user_agent": "UA"}, headers=AUTH)
+        no_body = await c.put("/app/v1/sites/yt/session", data="nope", headers=AUTH)
+        wrong_type = await c.put("/app/v1/sites/yt/session", json={"cookies": "x", "user_agent": "UA"}, headers=AUTH)
+        texts = [ok_text] + [await r.text() for r in (unknown, empty, no_body, wrong_type)]
+        return ok.status, unknown.status, empty.status, no_body.status, wrong_type.status, texts
+
+    ok, unknown, empty, no_body, wrong_type, texts = _run(go)
+    assert (ok, unknown, empty, no_body, wrong_type) == (200, 404, 400, 400, 400)
+    assert json.loads(texts[0]) == VIEW
+    assert fake_sites.saved == [("yt", [cookie], "UA")]
+    assert all(SECRET not in t for t in texts)
+
+
+def test_keepalive_starts_once_per_app_and_stops(fake_sites):
+    async def main():
+        app = web.Application()
+        routes.wire(app, FakeAdapter())
+        routes.wire(app, FakeAdapter())
+        async with TestClient(TestServer(app)):
+            await asyncio.sleep(0)
+            task = app[routes.KEEPALIVE_KEY]
+            assert len(fake_sites.started) == 1 and fake_sites.started[0] is adapter.publish
+            assert not task.done()
+        assert task.cancelled()
+
+    asyncio.run(main())
+
+
+def test_publish_stores_and_emits(monkeypatch):
+    events = []
+
+    class Ctx:
+        def emit(self, event, payload=None):
+            events.append((event, payload))
+
+    monkeypatch.setattr(adapter, "_ctx", Ctx())
+    notice = store.classify("hi")
+    adapter.publish(notice)
+    assert events == [("notice", notice)]
     assert store.latest(1)[0]["id"] == notice["id"]

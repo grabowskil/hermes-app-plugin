@@ -33,11 +33,16 @@ def _emit(notice: dict) -> None:
         logger.exception("hermes_app: could not emit %s (notice %s stored)", EVENT, notice.get("id"))
 
 
-def _deliver(content: str) -> dict:
-    """classify -> append -> emit."""
-    notice = store.classify(content)
+def publish(notice: dict) -> None:
+    """append -> emit. Also used by the sites keep-alive loop."""
     store.append(notice)
     _emit(notice)
+
+
+def _deliver(content: str) -> dict:
+    """classify -> publish."""
+    notice = store.classify(content)
+    publish(notice)
     return notice
 
 
