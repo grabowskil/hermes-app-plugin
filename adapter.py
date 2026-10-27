@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
-from . import activity, budget, pair, routes, store, todos
+from . import activity, budget, pair, profiles, routes, store, todos
 
 logger = logging.getLogger(__name__)
 
@@ -128,5 +128,11 @@ def register(ctx) -> None:
         ("transform_tool_result", budget.on_transform_tool_result),
     ):
         ctx.register_hook(hook, callback)
+    profiles.configure_store(store.DATA_DIR)
+    catalog_provider = profiles.discover_catalog
+    ctx.register_middleware(
+        "llm_request",
+        profiles.build_middleware(catalog_provider, profiles.get_store()),
+    )
     routes.register(ctx)
     pair.register(ctx)

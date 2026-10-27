@@ -40,5 +40,6 @@ capabilities:
     - transform_tool_result
     - post_llm_call
     - on_session_end
-  provides_middleware: []
+  provides_middleware:
+    - llm_request
   requires_env: []
