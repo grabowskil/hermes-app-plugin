@@ -15,7 +15,9 @@ from typing import Optional
 
 from aiohttp import web
 
-from . import activity, budget, host_browser, search, site_oauth, site_providers, sites, store, todos, transcript, upload
+import json
+
+from . import activity, budget, host_browser, profiles, search, site_oauth, site_providers, sites, store, todos, transcript, upload
 
 logger = logging.getLogger(__name__)
 
@@ -407,6 +409,38 @@ def _start_keepalive(publish):
     return start, stop
 
 
+async def profiles_catalog(_request: web.Request) -> web.Response:
+    cat = profiles.discover_catalog()
+    return web.json_response(profiles.catalog_to_dict(cat))
+
+
+async def session_profile_get(request: web.Request) -> web.Response:
+    session_id = request.match_info["id"]
+    state = profiles.get_store().get(session_id)
+    return web.json_response(
+        {"enabled": state.enabled, "profile_ids": state.profile_ids or []}
+    )
+
+
+async def session_profile_put(request: web.Request) -> web.Response:
+    session_id = request.match_info["id"]
+    try:
+        raw = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return web.json_response({"error": "invalid_json"}, status=400)
+    if not isinstance(raw, dict):
+        return web.json_response({"error": "invalid_body"}, status=400)
+    enabled = bool(raw.get("enabled", False))
+    ids_raw = raw.get("profile_ids") or []
+    if not isinstance(ids_raw, list):
+        return web.json_response({"error": "invalid_profile_ids"}, status=400)
+    profile_ids = [str(x) for x in ids_raw]
+    profiles.get_store().set(
+        session_id, profiles.SessionState(enabled=enabled, profile_ids=profile_ids)
+    )
+    return web.json_response({"enabled": enabled, "profile_ids": profile_ids})
+
+
 def wire(app: web.Application, adapter) -> None:
     """Add the ``/app/v1`` routes to the API server's application."""
     from .adapter import publish  # lazy: adapter imports this module
@@ -434,6 +468,9 @@ def wire(app: web.Application, adapter) -> None:
         ("POST", "/sites/{id}/oauth/finish", oauth_finish),
         ("POST", "/sites/{id}/host-login", host_login),
         ("POST", "/sites/{id}/host-login/finish", host_login_finish),
+        ("GET", "/profiles", profiles_catalog),
+        ("GET", "/sessions/{id}/profile", session_profile_get),
+        ("PUT", "/sessions/{id}/profile", session_profile_put),
     ):
         app.router.add_route(method, PREFIX + path, _authed(adapter, handler))
     if WIRED_KEY not in app:
