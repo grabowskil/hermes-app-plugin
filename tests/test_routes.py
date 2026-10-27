@@ -206,10 +206,10 @@ def test_capabilities(fake_browser):
         r = await c.get("/app/v1/capabilities", headers=AUTH)
         return r.status, await r.json()
 
-    base = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage"]
-    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.2.1", "features": base + ["host_login"]})
+    base = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity"]
+    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.4.0", "features": base + ["host_login"]})
     fake_browser.is_available = False
-    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.2.1", "features": base})
+    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.4.0", "features": base})
 
 
 def test_version_matches_manifest():

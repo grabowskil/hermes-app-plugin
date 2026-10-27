@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
-from . import pair, routes, store, todos
+from . import activity, budget, pair, routes, store, todos
 
 logger = logging.getLogger(__name__)
 
@@ -117,5 +117,16 @@ def register(ctx) -> None:
         emoji="📱",
     )
     ctx.register_hook("post_tool_call", todos.on_post_tool_call)
+    for hook, callback in (
+        ("pre_llm_call", activity.on_pre_llm_call),
+        ("pre_api_request", activity.on_pre_api_request),
+        ("post_api_request", activity.on_post_api_request),
+        ("post_tool_call", activity.on_post_tool_call),
+        ("post_llm_call", activity.on_turn_end),
+        ("on_session_end", activity.on_turn_end),
+        ("pre_tool_call", budget.on_pre_tool_call),
+        ("transform_tool_result", budget.on_transform_tool_result),
+    ):
+        ctx.register_hook(hook, callback)
     routes.register(ctx)
     pair.register(ctx)

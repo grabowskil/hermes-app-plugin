@@ -15,13 +15,13 @@ from typing import Optional
 
 from aiohttp import web
 
-from . import host_browser, search, site_oauth, sites, store, todos, upload
+from . import activity, budget, host_browser, search, site_oauth, sites, store, todos, transcript, upload
 
 logger = logging.getLogger(__name__)
 
 PLUGIN = "hermes_app"
-VERSION = "2.2.1"
-FEATURES = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage"]
+VERSION = "2.4.0"
+FEATURES = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity"]
 PREFIX = "/app/v1"
 KEEPALIVE_KEY = web.AppKey("hermes_app_sites_keepalive", asyncio.Task)  # the keepalive task
 WIRED_KEY = web.AppKey("hermes_app_wired", bool)  # once-per-app guard
@@ -116,6 +116,28 @@ async def get_todos(request: web.Request) -> web.Response:
     if plan is None:
         return web.json_response({"error": "no plan"}, status=404)
     return web.json_response({"session_id": session_id, "todos": plan})
+
+
+async def get_activity(request: web.Request) -> web.Response:
+    return web.json_response(activity.snapshot(request.match_info["id"]))
+
+
+async def get_messages(request: web.Request) -> web.Response:
+    try:
+        after_id = int(request.query.get("after_id", 0))
+        limit = int(request.query.get("limit", transcript.DEFAULT_LIMIT))
+    except ValueError:
+        return web.json_response({"error": "bad request"}, status=400)
+    page = await asyncio.to_thread(transcript.messages_after, request.match_info["id"], after_id, limit)
+    return web.json_response(page)
+
+
+async def put_mode(request: web.Request) -> web.Response:
+    try:
+        mode = (await request.json())["mode"]
+        return web.json_response({"mode": budget.set_mode(request.match_info["id"], mode)})
+    except Exception:  # bad JSON, no mode, or a mode budget refuses
+        return web.json_response({"error": "bad request"}, status=400)
 
 
 async def get_sites(request: web.Request) -> web.Response:
@@ -383,6 +405,8 @@ def wire(app: web.Application, adapter) -> None:
     """Add the ``/app/v1`` routes to the API server's application."""
     from .adapter import publish  # lazy: adapter imports this module
 
+    activity.bind(adapter)
+
     for method, path, handler in (
         ("GET", "/capabilities", capabilities),
         ("GET", "/notices", notices),
@@ -390,6 +414,9 @@ def wire(app: web.Application, adapter) -> None:
         ("POST", "/upload", upload_file),
         ("GET", "/search", search_messages),
         ("GET", "/todos", get_todos),
+        ("GET", "/sessions/{id}/activity", get_activity),
+        ("GET", "/sessions/{id}/messages", get_messages),
+        ("PUT", "/sessions/{id}/mode", put_mode),
         ("GET", "/sites", get_sites),
         ("PUT", "/sites/{id}/session", put_site_session),
         ("POST", "/sites/{id}/check", check_site),

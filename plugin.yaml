@@ -2,10 +2,10 @@ manifest_version: 2
 name: hermes_app
 label: Hermes App
 kind: platform
-version: 2.2.1
+version: 2.4.0
 description: >
   Server side of the Hermes iOS app. Stores gateway and cron notices, serves them with
-  upload, search, todo and site credential routes under /app/v1 on the API server's port, and prints
+  upload, search, todo, run activity, message and site credential routes under /app/v1 on the API server's port, limits tool calls per turn (quick or deep mode), and prints
   a pairing QR code (hermes app pair). Site credentials are API keys, OAuth tokens or cookie logins.
   Receives no inbound messages. Makes network calls only to sites you add (login checks, OAuth token
   exchange). May start a local Chrome on the host for host logins.
@@ -16,7 +16,14 @@ requires_hermes: ">=0.22.2"
 python_dependencies:
   - "segno>=1.6,<2"
 provides_hooks:
+  - pre_llm_call
+  - pre_api_request
+  - post_api_request
+  - pre_tool_call
   - post_tool_call
+  - transform_tool_result
+  - post_llm_call
+  - on_session_end
 optional_env:
   - name: HERMES_APP_HOME_CHANNEL
     description: "Home channel id for gateway notices and cron delivery (any non-empty value, e.g. app)"
@@ -25,6 +32,13 @@ optional_env:
 capabilities:
   provides_tools: []
   provides_hooks:
+    - pre_llm_call
+    - pre_api_request
+    - post_api_request
+    - pre_tool_call
     - post_tool_call
+    - transform_tool_result
+    - post_llm_call
+    - on_session_end
   provides_middleware: []
   requires_env: []
