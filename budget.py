@@ -2,10 +2,11 @@
 
 ``on_pre_tool_call`` counts tool calls per (session, turn) and blocks at the hard limit, and web or
 browser tools at their own limit. ``on_transform_tool_result`` appends a note to each result from the
-soft limit on. The mode (quick or deep) is set per session by ``PUT /app/v1/sessions/{id}/mode``; the
-default is quick. Other platforms are untouched. Limits can be overridden in
-``<HERMES_HOME>/hermes_app/budget.json`` as ``{"quick": {"soft", "hard", "web"}, "deep": {...}}``.
-Counters live in memory only. Every hook fails open.
+soft limit on. The mode is set per session by ``PUT /app/v1/sessions/{id}/mode``: ``quick`` (the
+default), ``deep``, or ``unlimited``. Unlimited switches the guard off: nothing is counted, blocked or
+noted (Hermes' own ``agent.max_turns`` still applies). Other platforms are untouched. Limits for quick
+and deep can be overridden in ``<HERMES_HOME>/hermes_app/budget.json`` as
+``{"quick": {"soft", "hard", "web"}, "deep": {...}}``. Counters live in memory only. Every hook fails open.
 """
 import json
 import logging
@@ -15,8 +16,9 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-MODES = ("quick", "deep")
+MODES = ("quick", "deep", "unlimited")
 DEFAULT_MODE = "quick"
+UNLIMITED = "unlimited"
 LIMITS = {
     "quick": {"soft": 12, "hard": 25, "web": 4},
     "deep": {"soft": 30, "hard": 60, "web": 12},
@@ -45,7 +47,7 @@ def _load_limits() -> dict[str, dict[str, int]]:
         log.exception("hermes_app: could not read budget.json")
         return limits
     if isinstance(data, dict):
-        for mode in MODES:
+        for mode in LIMITS:
             over = data.get(mode)
             if not isinstance(over, dict):
                 continue
@@ -101,9 +103,12 @@ def on_pre_tool_call(**kwargs):
         key = _key(kwargs)
         if key is None:
             return None
+        mode = get_mode(key[0])
+        if mode == UNLIMITED:
+            return None
         tool_name = kwargs.get("tool_name")
         web = isinstance(tool_name, str) and _is_web(tool_name)
-        limits = _limits_for(get_mode(key[0]))
+        limits = _limits_for(mode)
         with _lock:
             counts = _counts.get(key)
             if counts is None:
@@ -128,7 +133,10 @@ def on_transform_tool_result(**kwargs):
         result = kwargs.get("result")
         if key is None or not isinstance(result, str):
             return None
-        soft = _limits_for(get_mode(key[0]))["soft"]
+        mode = get_mode(key[0])
+        if mode == UNLIMITED:
+            return None
+        soft = _limits_for(mode)["soft"]
         with _lock:
             counts = _counts.get(key)
             calls = counts[0] if counts else 0

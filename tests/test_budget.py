@@ -65,6 +65,20 @@ def test_deep_mode_limits():
     assert call()["action"] == "block"
 
 
+def test_unlimited_never_blocks_or_notes():
+    assert budget.set_mode(SID, "unlimited") == "unlimited"
+    for tool in ["terminal"] * 110 + ["web_search", "browser_navigate"] * 60:
+        assert call(tool) is None
+        assert budget.on_transform_tool_result(
+            tool_name=tool, session_id=SID, turn_id="t1", result="ok"
+        ) is None
+
+
+def test_set_mode_unlimited_round_trips():
+    budget.set_mode(SID, "unlimited")
+    assert budget.get_mode(SID) == "unlimited"
+
+
 def test_mode_default_and_validation():
     assert budget.get_mode(SID) == "quick"
     with pytest.raises(ValueError):

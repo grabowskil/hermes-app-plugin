@@ -37,13 +37,14 @@ All routes live on the API server's own port (default 8642) and need the same
 - `GET /app/v1/todos?session_id=`: the agent's latest todo list for a session, kept in memory by the `post_tool_call` hook (lost on restart). `200 {"session_id", "todos"}`, `404 {"error": "no plan"}`, `400` without `session_id`.
 - `GET /app/v1/sessions/{id}/activity`: what the agent is doing in a session, fed by agent hooks (lost on restart). `{"active", "kind": "run"|"background"|null, "run_id", "api_calls", "tool_calls", "tokens_in", "tokens_out", "started_at", "updated_at", "mode"}`; times are epoch seconds and counters cover the current or last turn. `active` is false after the turn ends or 90 s without a hook, unless a `/v1/runs` run of the session is still live. `kind` is `run` with that run's `run_id`, else `background` (for example the memory review that runs after a turn).
 - `GET /app/v1/sessions/{id}/messages?after_id=0&limit=100`: `{"data": [message], "last_id"}`, oldest first, limit at most 200. Same fields as the API server's `GET /api/sessions/{id}/messages`; tool output is cut to 1,500 characters and flagged `"truncated": true`.
-- `PUT /app/v1/sessions/{id}/mode` with `{"mode": "quick"|"deep"}`: returns `{"mode"}`, `400` for any other value. Kept in memory; the default is `quick`.
+- `PUT /app/v1/sessions/{id}/mode` with `{"mode": "quick"|"deep"|"unlimited"}`: returns `{"mode"}`, `400` for any other value. Kept in memory; the default is `quick`.
 
 ## Run budget
 
 The plugin caps tool calls per turn in API server sessions (`api_` session ids). Quick mode allows 12 calls
 before each tool result carries a note to answer now, and blocks at 25; deep mode 30 and 60. Web and browser
 tools are capped at 4 (quick) or 12 (deep). Override the numbers in `<HERMES_HOME>/hermes_app/budget.json`.
+Unlimited mode (`"unlimited"`) switches the guard off: nothing is counted, blocked or noted.
 
 ## Site providers (CLI)
 
