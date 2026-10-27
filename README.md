@@ -27,7 +27,7 @@ hermes gateway restart
 All routes live on the API server's own port (default 8642) and need the same
 `Authorization: Bearer $API_SERVER_KEY` as the rest of the API server. Without it they return `401`.
 
-- `GET /app/v1/capabilities`: `{"plugin": "hermes_app", "version": "2.3.0", "features": ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "site_providers"]}`. The app calls this first; a `404` means the plugin is not installed and the app hides the features above.
+- `GET /app/v1/capabilities`: `{"plugin": "hermes_app", "version": "2.5.0", "features": ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers"]}`. The app calls this first; a `404` means the plugin is not installed and the app hides the features above.
 - `GET /app/v1/sites/providers`: `{"providers": [{"id", "name", "kind", "help", "flows", "fields"}]}`, the OAuth providers the host knows (`google`, `ebay`); `fields[]` is `{key, label, secret?, required?, default?}`. The server-only endpoints and switches are never served. Announced by the `site_providers` feature.
 - `POST /app/v1/sites`: add or update a site. For OAuth, `provider` (`google`, `ebay`) fills the endpoints and defaults; `preset: "google"` is the old name and stays an alias. With a provider only its `fields` keys (`client_id`, `client_secret`, `scopes`, `redirect_uri`, `redirect_param`) are read from the body. A site with `redirect_param` (eBay RuName) signs in with Safari only; host login answers `400 {"error": "sign in with Safari for this site"}`.
 - `GET /app/v1/notices?limit=100`: `{"notices": [...]}`, newest first.
@@ -35,6 +35,15 @@ All routes live on the API server's own port (default 8642) and need the same
 - `POST /app/v1/upload`: raw file body with `Content-Type` and `X-Filename` (percent-encoded), up to 10 MB (the API server's body limit; `413` above). Stores `~/.hermes/uploads/<YYYY-MM-DD>/<8 hex>-<name>` and returns `201 {"path", "name", "size", "mime"}`. `path` is absolute and goes into the run input for the vision or file tools.
 - `GET /app/v1/search?q=&limit=30`: full-text match over user and assistant messages, limit at most 50. Returns `{"hits": [{"session_id", "session_title", "message_id", "role", "snippet", "timestamp"}]}`. The snippet marks matches with `**`. Queries under 2 characters give `{"hits": []}`.
 - `GET /app/v1/todos?session_id=`: the agent's latest todo list for a session, kept in memory by the `post_tool_call` hook (lost on restart). `200 {"session_id", "todos"}`, `404 {"error": "no plan"}`, `400` without `session_id`.
+- `GET /app/v1/sessions/{id}/activity`: what the agent is doing in a session, fed by agent hooks (lost on restart). `{"active", "kind": "run"|"background"|null, "run_id", "api_calls", "tool_calls", "tokens_in", "tokens_out", "started_at", "updated_at", "mode"}`; times are epoch seconds and counters cover the current or last turn. `active` is false after the turn ends or 90 s without a hook, unless a `/v1/runs` run of the session is still live. `kind` is `run` with that run's `run_id`, else `background` (for example the memory review that runs after a turn).
+- `GET /app/v1/sessions/{id}/messages?after_id=0&limit=100`: `{"data": [message], "last_id"}`, oldest first, limit at most 200. Same fields as the API server's `GET /api/sessions/{id}/messages`; tool output is cut to 1,500 characters and flagged `"truncated": true`.
+- `PUT /app/v1/sessions/{id}/mode` with `{"mode": "quick"|"deep"}`: returns `{"mode"}`, `400` for any other value. Kept in memory; the default is `quick`.
+
+## Run budget
+
+The plugin caps tool calls per turn in API server sessions (`api_` session ids). Quick mode allows 12 calls
+before each tool result carries a note to answer now, and blocks at 25; deep mode 30 and 60. Web and browser
+tools are capped at 4 (quick) or 12 (deep). Override the numbers in `<HERMES_HOME>/hermes_app/budget.json`.
 
 ## Site providers (CLI)
 
@@ -95,6 +104,7 @@ What a user should know before installing (Hermes catalog rule 13):
 - `pair.py`: `hermes app pair`.
 - `store.py`: notice classifier, JSONL notice store, device lists.
 - `upload.py`, `search.py`, `todos.py`: upload storage, search query, todo list hook.
+- `activity.py`, `transcript.py`, `budget.py`: live activity per session, incremental message reads, run budget.
 - `tests/`: pytest tests.
 
 ## Tests
