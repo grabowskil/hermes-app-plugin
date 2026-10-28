@@ -2,10 +2,11 @@ manifest_version: 2
 name: hermes_app
 label: Hermes App
 kind: platform
-version: 2.5.0
+version: 2.6.0
 description: >
   Server side of the Hermes iOS app. Stores gateway and cron notices, serves them with
-  upload, search, todo, run activity, message and site credential routes under /app/v1 on the API server's port, limits tool calls per turn (quick or deep mode), and prints
+  upload, search, todo, run activity, message, voice (speech-to-text and text-to-speech through Hermes's
+  own tools) and site credential routes under /app/v1 on the API server's port, limits tool calls per turn (quick or deep mode), and prints
   a pairing QR code (hermes app pair). Site credentials are API keys, OAuth tokens (Google, eBay and other providers, listed at /sites/providers) or cookie logins.
   Receives no inbound messages. Makes network calls only to sites you add (login checks, OAuth token
   exchange). May start a local Chrome on the host for host logins.

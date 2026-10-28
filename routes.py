@@ -17,12 +17,12 @@ from aiohttp import web
 
 import json
 
-from . import activity, budget, host_browser, profiles, search, site_oauth, site_providers, sites, store, todos, transcript, upload
+from . import activity, budget, host_browser, profiles, search, site_oauth, site_providers, sites, store, todos, transcript, upload, voice
 
 logger = logging.getLogger(__name__)
 
 PLUGIN = "hermes_app"
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 FEATURES = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers"]
 PREFIX = "/app/v1"
 KEEPALIVE_KEY = web.AppKey("hermes_app_sites_keepalive", asyncio.Task)  # the keepalive task
@@ -57,7 +57,8 @@ def _authed(adapter, handler):
 
 
 async def capabilities(request: web.Request) -> web.Response:
-    features = FEATURES + (["host_login"] if host_browser.available() else [])
+    voice_features = await asyncio.get_running_loop().run_in_executor(None, voice.features)
+    features = FEATURES + voice_features + (["host_login"] if host_browser.available() else [])
     return web.json_response({"plugin": PLUGIN, "version": VERSION, "features": features})
 
 
@@ -99,6 +100,44 @@ async def upload_file(request: web.Request) -> web.Response:
         logger.exception("hermes_app: could not store upload")
         return web.json_response({"error": "save failed"}, status=500)
     return web.json_response(saved, status=201)
+
+
+async def voice_transcribe(request: web.Request) -> web.Response:
+    suffix = voice.EXTENSIONS.get(request.content_type)
+    if suffix is None:
+        return web.json_response({"error": "unsupported audio type"}, status=400)
+    body = await request.read()
+    if not body:
+        return web.json_response({"error": "empty body"}, status=400)
+    if len(body) > voice.MAX_BYTES:
+        return web.json_response({"error": "payload too large"}, status=413)
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(None, voice.transcribe, body, suffix)
+    except Exception:
+        logger.exception("hermes_app: transcription failed")
+        return web.json_response({"error": "transcription failed"}, status=502)
+    if not result.get("success"):
+        logger.warning("hermes_app: transcription refused: %s", result.get("error"))
+        return web.json_response({"error": "transcription failed"}, status=502)
+    transcript_text = str(result.get("transcript") or "").strip()
+    return web.json_response({"transcript": transcript_text, "provider": result.get("provider")})
+
+
+async def voice_speak(request: web.Request) -> web.Response:
+    try:
+        text = str((await request.json())["text"]).strip()
+    except Exception:
+        return web.json_response({"error": "bad request"}, status=400)
+    if not text:
+        return web.json_response({"error": "empty text"}, status=400)
+    if len(text) > voice.MAX_TEXT:
+        return web.json_response({"error": "text too long"}, status=400)
+    try:
+        audio, content_type = await asyncio.get_running_loop().run_in_executor(None, voice.speak, text)
+    except Exception:
+        logger.exception("hermes_app: speech failed")
+        return web.json_response({"error": "speech failed"}, status=502)
+    return web.Response(body=audio, content_type=content_type)
 
 
 async def search_messages(request: web.Request) -> web.Response:
@@ -453,6 +492,8 @@ def wire(app: web.Application, adapter) -> None:
         ("POST", "/devices", devices),
         ("POST", "/upload", upload_file),
         ("GET", "/search", search_messages),
+        ("POST", "/voice/transcribe", voice_transcribe),
+        ("POST", "/voice/speak", voice_speak),
         ("GET", "/todos", get_todos),
         ("GET", "/sessions/{id}/activity", get_activity),
         ("GET", "/sessions/{id}/messages", get_messages),

@@ -1,8 +1,8 @@
 # hermes_app
 
 Gateway plugin for the Hermes iOS app. It turns gateway and cron notices into Inbox entries,
-serves them to the app together with attachment upload, message search and the agent's todo
-list, and pairs the app with your host through a QR code. Requires Hermes 0.22.2 or newer and the
+serves them to the app together with attachment upload, message search, voice (speech in and out
+through Hermes's own tools), the agent's todo list, and pairs the app with your host through a QR code. Requires Hermes 0.22.2 or newer and the
 API server (`API_SERVER_KEY`).
 
 ## About this repository
@@ -27,17 +27,34 @@ hermes gateway restart
 All routes live on the API server's own port (default 8642) and need the same
 `Authorization: Bearer $API_SERVER_KEY` as the rest of the API server. Without it they return `401`.
 
-- `GET /app/v1/capabilities`: `{"plugin": "hermes_app", "version": "2.5.0", "features": ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers"]}`. The app calls this first; a `404` means the plugin is not installed and the app hides the features above.
+- `GET /app/v1/capabilities`: `{"plugin": "hermes_app", "version": "2.6.0", "features": ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers"]}`, plus `voice_stt` and/or `voice_tts` when the Hermes side can serve them (see Voice). The app calls this first; a `404` means the plugin is not installed and the app hides the features above.
 - `GET /app/v1/sites/providers`: `{"providers": [{"id", "name", "kind", "help", "flows", "fields"}]}`, the OAuth providers the host knows (`google`, `ebay`); `fields[]` is `{key, label, secret?, required?, default?}`. The server-only endpoints and switches are never served. Announced by the `site_providers` feature.
 - `POST /app/v1/sites`: add or update a site. For OAuth, `provider` (`google`, `ebay`) fills the endpoints and defaults; `preset: "google"` is the old name and stays an alias. With a provider only its `fields` keys (`client_id`, `client_secret`, `scopes`, `redirect_uri`, `redirect_param`) are read from the body. A site with `redirect_param` (eBay RuName) signs in with Safari only; host login answers `400 {"error": "sign in with Safari for this site"}`.
 - `GET /app/v1/notices?limit=100`: `{"notices": [...]}`, newest first.
 - `POST /app/v1/devices`: `{token, environment?, kind?}`. `environment` is `production` (default) or `sandbox`; `kind: "widget"` stores the token in `widget_devices.json`, apart from the alert devices. The plugin only stores tokens; it sends no push.
 - `POST /app/v1/upload`: raw file body with `Content-Type` and `X-Filename` (percent-encoded), up to 10 MB (the API server's body limit; `413` above). Stores `~/.hermes/uploads/<YYYY-MM-DD>/<8 hex>-<name>` and returns `201 {"path", "name", "size", "mime"}`. `path` is absolute and goes into the run input for the vision or file tools.
 - `GET /app/v1/search?q=&limit=30`: full-text match over user and assistant messages, limit at most 50. Returns `{"hits": [{"session_id", "session_title", "message_id", "role", "snippet", "timestamp"}]}`. The snippet marks matches with `**`. Queries under 2 characters give `{"hits": []}`.
+- `POST /app/v1/voice/transcribe`: raw audio body, `Content-Type` `audio/mp4`, `audio/x-m4a`, `audio/wav`, `audio/mpeg`, `audio/ogg` or `audio/x-caf`, up to 10 MB (`413` above, `400` for an empty body or another type). `200 {"transcript", "provider"}`; silence and filtered hallucinations give `""`. `502 {"error"}` when the speech-to-text provider fails. Announced by `voice_stt`.
+- `POST /app/v1/voice/speak`: `{"text"}`, at most 4000 characters after trimming (`400` otherwise). `200` with the audio, `Content-Type` `audio/mpeg` or `audio/ogg`; `502 {"error"}` when synthesis fails. Announced by `voice_tts`.
 - `GET /app/v1/todos?session_id=`: the agent's latest todo list for a session, kept in memory by the `post_tool_call` hook (lost on restart). `200 {"session_id", "todos"}`, `404 {"error": "no plan"}`, `400` without `session_id`.
 - `GET /app/v1/sessions/{id}/activity`: what the agent is doing in a session, fed by agent hooks (lost on restart). `{"active", "kind": "run"|"background"|null, "run_id", "api_calls", "tool_calls", "tokens_in", "tokens_out", "started_at", "updated_at", "mode"}`; times are epoch seconds and counters cover the current or last turn. `active` is false after the turn ends or 90 s without a hook, unless a `/v1/runs` run of the session is still live. `kind` is `run` with that run's `run_id`, else `background` (for example the memory review that runs after a turn).
 - `GET /app/v1/sessions/{id}/messages?after_id=0&limit=100`: `{"data": [message], "last_id"}`, oldest first, limit at most 200. Same fields as the API server's `GET /api/sessions/{id}/messages`; tool output is cut to 1,500 characters and flagged `"truncated": true`.
 - `PUT /app/v1/sessions/{id}/mode` with `{"mode": "quick"|"deep"|"unlimited"}`: returns `{"mode"}`, `400` for any other value. Kept in memory; the default is `quick`.
+
+## Voice
+
+The voice routes wrap two Hermes tools, `tools.voice_mode.transcribe_recording` and `tools.tts_tool.text_to_speech_tool`.
+The plugin adds no provider of its own: the host chooses providers in the Hermes config.
+
+- Speech to text: run `hermes tools` and enable speech-to-text. The plugin announces `voice_stt` only when
+  `stt.enabled: true` is set in `<HERMES_HOME>/config.yaml` and the Hermes voice module imports.
+  `stt.language` is the Whisper language hint (default `en`); set `""` to auto-detect.
+- Text to speech: `tts.provider` (default `edge`). The plugin announces `voice_tts` when Hermes reports the
+  TTS requirements as met (checked at most every 60 s).
+- Edge TTS pin: Hermes pins `edge-tts==7.2.7`, which Microsoft's service rejects with `403`. Install `edge-tts==7.3.1`
+  into the Hermes environment (`~/.hermes/hermes-agent/venv/bin/pip install edge-tts==7.3.1`) until Hermes updates its pin.
+- Audio is converted with `ffmpeg`, so it must be on the host's `PATH`.
+- The temp files of both directions are deleted after each request.
 
 ## Run budget
 
@@ -87,12 +104,14 @@ What a user should know before installing (Hermes catalog rule 13):
 
 - Serves the routes above on the API server's port. It opens no listener of its own.
 - Reads `~/.hermes/state.db` read-only for search.
-- Writes uploads to `~/.hermes/uploads/`.
+- Writes uploads to `~/.hermes/uploads/`. Voice requests write audio to the system temp folder for the length of one request.
 - Stores notices and device tokens in `~/.hermes/hermes_app/` (`notices.jsonl`, `devices.json`, `widget_devices.json`; override the folder with `HERMES_APP_DATA_DIR`).
 - Keeps the agent's todo lists in memory.
-- Makes no network calls, runs no shell commands, starts no background processes, sends no telemetry.
+- The plugin itself makes no network calls, runs no shell commands, starts no background processes, sends no telemetry.
+  Voice requests run Hermes's speech tools, which call the speech-to-text and text-to-speech providers you configure
+  (edge TTS reaches Microsoft's speech service; a cloud STT provider receives the audio).
 - `hermes app pair` reads `API_SERVER_KEY` through `agent.secret_scope` and prints it inside the link. The plugin stores no credentials of its own and reads no `.env` or key files.
-- Third-party services: none. The only network peer is the app on your own network, talking to your API server.
+- Third-party services: only the speech providers Hermes is configured to use for voice. The app talks to your API server on your own network.
 - `tests/`, `.github/` and this README are part of the mirror and are installed with the plugin; they do nothing at runtime.
 
 ## Files
@@ -105,6 +124,7 @@ What a user should know before installing (Hermes catalog rule 13):
 - `pair.py`: `hermes app pair`.
 - `store.py`: notice classifier, JSONL notice store, device lists.
 - `upload.py`, `search.py`, `todos.py`: upload storage, search query, todo list hook.
+- `voice.py`: speech-to-text and text-to-speech through Hermes's tools, feature check.
 - `activity.py`, `transcript.py`, `budget.py`: live activity per session, incremental message reads, run budget.
 - `tests/`: pytest tests.
 

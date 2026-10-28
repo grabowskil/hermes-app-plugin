@@ -201,15 +201,17 @@ def test_no_key_configured_refuses():
     assert _run(go, NoKey()) == 401
 
 
-def test_capabilities(fake_browser):
+def test_capabilities(fake_browser, monkeypatch):
+    monkeypatch.setattr(routes.voice, "features", lambda: [])
+
     async def go(c):
         r = await c.get("/app/v1/capabilities", headers=AUTH)
         return r.status, await r.json()
 
     base = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers"]
-    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.5.0", "features": base + ["host_login"]})
+    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.6.0", "features": base + ["host_login"]})
     fake_browser.is_available = False
-    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.5.0", "features": base})
+    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.6.0", "features": base})
 
 
 def test_version_matches_manifest():
