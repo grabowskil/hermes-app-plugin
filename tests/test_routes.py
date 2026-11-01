@@ -170,7 +170,8 @@ def test_every_route_needs_the_key():
     async def go(c):
         out = []
         for method, path in (("GET", "/capabilities"), ("GET", "/notices"), ("POST", "/devices"),
-                             ("POST", "/upload"), ("GET", "/search?q=hello"), ("GET", "/todos?session_id=s"), ("GET", "/sites"),
+                             ("POST", "/upload"), ("GET", "/search?q=hello"), ("GET", "/stats"),
+                             ("GET", "/files?session=s&path=/x"), ("GET", "/share/actions"), ("GET", "/todos?session_id=s"), ("GET", "/sites"),
                              ("PUT", "/sites/yt/session"), ("POST", "/sites/yt/check"), ("POST", "/sites"),
                              ("DELETE", "/sites/yt"), ("PUT", "/sites/yt/api-key"), ("POST", "/sites/yt/oauth/start"),
                              ("POST", "/sites/yt/oauth/finish"), ("POST", "/sites/yt/host-login"),
@@ -208,10 +209,12 @@ def test_capabilities(fake_browser, monkeypatch):
         r = await c.get("/app/v1/capabilities", headers=AUTH)
         return r.status, await r.json()
 
-    base = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers"]
-    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.6.0", "features": base + ["host_login"]})
+    base = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers",
+            "stats", "files", "share_actions"]
+    expect = {"plugin": "hermes_app", "version": "2.7.0", "min_app": "1.0"}
+    assert _run(go) == (200, {**expect, "features": base + ["host_login"]})
     fake_browser.is_available = False
-    assert _run(go) == (200, {"plugin": "hermes_app", "version": "2.6.0", "features": base})
+    assert _run(go) == (200, {**expect, "features": base})
 
 
 def test_version_matches_manifest():

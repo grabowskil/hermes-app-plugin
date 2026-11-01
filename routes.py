@@ -11,19 +11,23 @@ Without a usable key every request is refused.
 import asyncio
 import hmac
 import logging
+import mimetypes
+import os
 from typing import Optional
 
 from aiohttp import web
 
 import json
 
-from . import activity, budget, host_browser, profiles, search, site_oauth, site_providers, sites, store, todos, transcript, upload, voice
+from . import activity, budget, files, host_browser, profiles, search, share, site_oauth, site_providers, sites, stats, store, todos, transcript, upload, voice
 
 logger = logging.getLogger(__name__)
 
 PLUGIN = "hermes_app"
-VERSION = "2.6.0"
-FEATURES = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers"]
+VERSION = "2.7.0"
+MIN_APP = "1.0"  # oldest app build this plugin still serves
+FEATURES = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers", "stats", "files",
+            "share_actions"]
 PREFIX = "/app/v1"
 KEEPALIVE_KEY = web.AppKey("hermes_app_sites_keepalive", asyncio.Task)  # the keepalive task
 WIRED_KEY = web.AppKey("hermes_app_wired", bool)  # once-per-app guard
@@ -59,7 +63,7 @@ def _authed(adapter, handler):
 async def capabilities(request: web.Request) -> web.Response:
     voice_features = await asyncio.get_running_loop().run_in_executor(None, voice.features)
     features = FEATURES + voice_features + (["host_login"] if host_browser.available() else [])
-    return web.json_response({"plugin": PLUGIN, "version": VERSION, "features": features})
+    return web.json_response({"plugin": PLUGIN, "version": VERSION, "min_app": MIN_APP, "features": features})
 
 
 async def notices(request: web.Request) -> web.Response:
@@ -147,6 +151,29 @@ async def search_messages(request: web.Request) -> web.Response:
         limit = search.DEFAULT_LIMIT
     hits = await asyncio.to_thread(search.query, request.query.get("q", ""), limit)
     return web.json_response({"hits": hits})
+
+
+async def get_stats(request: web.Request) -> web.Response:
+    return web.json_response(await asyncio.to_thread(stats.snapshot))
+
+
+async def get_file(request: web.Request) -> web.Response:
+    session_id = request.query.get("session", "").strip()
+    path = request.query.get("path", "")
+    if not session_id or not path.startswith("/"):
+        return web.json_response({"error": "session and an absolute path required"}, status=400)
+    if not await asyncio.to_thread(files.is_named, session_id, path):
+        return web.json_response({"error": "file not named in this session"}, status=403)
+    if not await asyncio.to_thread(os.path.isfile, path):
+        return web.json_response({"error": "not found"}, status=404)
+    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    name = os.path.basename(path).replace('"', "").replace("\r", "").replace("\n", "")
+    return web.FileResponse(path, headers={"Content-Type": mime,
+                                           "Content-Disposition": f'attachment; filename="{name}"'})
+
+
+async def get_share_actions(request: web.Request) -> web.Response:
+    return web.json_response(await asyncio.to_thread(share.load))
 
 
 async def get_todos(request: web.Request) -> web.Response:
@@ -492,6 +519,9 @@ def wire(app: web.Application, adapter) -> None:
         ("POST", "/devices", devices),
         ("POST", "/upload", upload_file),
         ("GET", "/search", search_messages),
+        ("GET", "/stats", get_stats),
+        ("GET", "/files", get_file),
+        ("GET", "/share/actions", get_share_actions),
         ("POST", "/voice/transcribe", voice_transcribe),
         ("POST", "/voice/speak", voice_speak),
         ("GET", "/todos", get_todos),

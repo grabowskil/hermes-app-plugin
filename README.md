@@ -27,19 +27,39 @@ hermes gateway restart
 All routes live on the API server's own port (default 8642) and need the same
 `Authorization: Bearer $API_SERVER_KEY` as the rest of the API server. Without it they return `401`.
 
-- `GET /app/v1/capabilities`: `{"plugin": "hermes_app", "version": "2.6.0", "features": ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers"]}`, plus `voice_stt` and/or `voice_tts` when the Hermes side can serve them (see Voice). The app calls this first; a `404` means the plugin is not installed and the app hides the features above.
+- `GET /app/v1/capabilities`: `{"plugin": "hermes_app", "version": "2.7.0", "min_app": "1.0", "features": ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers", "stats", "files", "share_actions"]}`, plus `voice_stt` and/or `voice_tts` when the Hermes side can serve them (see Voice). The app calls this first; a `404` means the plugin is not installed and the app hides the features above.
 - `GET /app/v1/sites/providers`: `{"providers": [{"id", "name", "kind", "help", "flows", "fields"}]}`, the OAuth providers the host knows (`google`, `ebay`); `fields[]` is `{key, label, secret?, required?, default?}`. The server-only endpoints and switches are never served. Announced by the `site_providers` feature.
 - `POST /app/v1/sites`: add or update a site. For OAuth, `provider` (`google`, `ebay`) fills the endpoints and defaults; `preset: "google"` is the old name and stays an alias. With a provider only its `fields` keys (`client_id`, `client_secret`, `scopes`, `redirect_uri`, `redirect_param`) are read from the body. A site with `redirect_param` (eBay RuName) signs in with Safari only; host login answers `400 {"error": "sign in with Safari for this site"}`.
 - `GET /app/v1/notices?limit=100`: `{"notices": [...]}`, newest first.
 - `POST /app/v1/devices`: `{token, environment?, kind?}`. `environment` is `production` (default) or `sandbox`; `kind: "widget"` stores the token in `widget_devices.json`, apart from the alert devices. The plugin only stores tokens; it sends no push.
 - `POST /app/v1/upload`: raw file body with `Content-Type` and `X-Filename` (percent-encoded), up to 10 MB (the API server's body limit; `413` above). Stores `~/.hermes/uploads/<YYYY-MM-DD>/<8 hex>-<name>` and returns `201 {"path", "name", "size", "mime"}`. `path` is absolute and goes into the run input for the vision or file tools.
 - `GET /app/v1/search?q=&limit=30`: full-text match over user and assistant messages, limit at most 50. Returns `{"hits": [{"session_id", "session_title", "message_id", "role", "snippet", "timestamp"}]}`. The snippet marks matches with `**`. Queries under 2 characters give `{"hits": []}`.
+- `GET /app/v1/stats`: `{"sessions_7d", "messages_7d", "tool_calls_7d", "sessions_total"}`, all integers, read from `state.db` (zeros when it is missing). Tool calls are the tool result rows. Announced by `stats`.
+- `GET /app/v1/files?session=<id>&path=<absolute path>`: an artefact file. The agent hands a file over by writing `MEDIA:<absolute path>` in a reply (Hermes stores the text unchanged). The file is served only when that exact tag occurs in an assistant message of the session: `403` otherwise, `400` for a relative path, `404` when it is not a regular file. `200` streams the file with a guessed `Content-Type` and `Content-Disposition: attachment; filename="<name>"`. Announced by `files`.
+- `GET /app/v1/share/actions`: `{"decide_prompt": string|null, "actions": [{"id", "label", "prompt", "match"}]}` for the app's share chooser, read from `<HERMES_HOME>/hermes_app/share_actions.yaml` (see Share actions). Announced by `share_actions`.
 - `POST /app/v1/voice/transcribe`: raw audio body, `Content-Type` `audio/mp4`, `audio/x-m4a`, `audio/wav`, `audio/mpeg`, `audio/ogg` or `audio/x-caf`, up to 10 MB (`413` above, `400` for an empty body or another type). `200 {"transcript", "provider"}`; silence and filtered hallucinations give `""`. `502 {"error"}` when the speech-to-text provider fails. Announced by `voice_stt`.
 - `POST /app/v1/voice/speak`: `{"text"}`, at most 4000 characters after trimming (`400` otherwise). `200` with the audio, `Content-Type` `audio/mpeg` or `audio/ogg`; `502 {"error"}` when synthesis fails. Announced by `voice_tts`.
 - `GET /app/v1/todos?session_id=`: the agent's latest todo list for a session, kept in memory by the `post_tool_call` hook (lost on restart). `200 {"session_id", "todos"}`, `404 {"error": "no plan"}`, `400` without `session_id`.
 - `GET /app/v1/sessions/{id}/activity`: what the agent is doing in a session, fed by agent hooks (lost on restart). `{"active", "kind": "run"|"background"|null, "run_id", "api_calls", "tool_calls", "tokens_in", "tokens_out", "started_at", "updated_at", "mode"}`; times are epoch seconds and counters cover the current or last turn. `active` is false after the turn ends or 90 s without a hook, unless a `/v1/runs` run of the session is still live. `kind` is `run` with that run's `run_id`, else `background` (for example the memory review that runs after a turn).
 - `GET /app/v1/sessions/{id}/messages?after_id=0&limit=100`: `{"data": [message], "last_id"}`, oldest first, limit at most 200. Same fields as the API server's `GET /api/sessions/{id}/messages`; tool output is cut to 1,500 characters and flagged `"truncated": true`.
 - `PUT /app/v1/sessions/{id}/mode` with `{"mode": "quick"|"deep"|"unlimited"}`: returns `{"mode"}`, `400` for any other value. Kept in memory; the default is `quick`.
+
+## Share actions
+
+Optional `<HERMES_HOME>/hermes_app/share_actions.yaml`; without it the chooser has no host actions and the app
+uses its own decide prompt. Entries without `id`, `label` or `prompt`, or with another `match`, are dropped.
+
+```yaml
+decide_prompt: "I shared this. Decide what to do with it: {item}"   # optional
+actions:
+  - id: summarize
+    label: Summarize
+    prompt: "Summarize this for me: {item}"
+    match: url        # url, text, image or any (default)
+```
+
+The app replaces `{item}` with the shared item (title and URL, or the text) and appends the user's
+instructions, if any, after a blank line.
 
 ## Voice
 
@@ -124,6 +144,7 @@ What a user should know before installing (Hermes catalog rule 13):
 - `pair.py`: `hermes app pair`.
 - `store.py`: notice classifier, JSONL notice store, device lists.
 - `upload.py`, `search.py`, `todos.py`: upload storage, search query, todo list hook.
+- `stats.py`, `files.py`, `share.py`: usage counters, artefact path check, share actions file.
 - `voice.py`: speech-to-text and text-to-speech through Hermes's tools, feature check.
 - `activity.py`, `transcript.py`, `budget.py`: live activity per session, incremental message reads, run budget.
 - `tests/`: pytest tests.
