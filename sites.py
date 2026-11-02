@@ -2,8 +2,9 @@
 
 ``cookie``: the app logs in inside a web view and uploads the cookies once (``save_session``). From
 then on only the host uses them: ``check`` fetches ``check_url`` with the jar and the stored user
-agent, and the site counts as logged in while the body contains ``marker``. Skills read the jar
-through ``cookie_file``. ``api_key``: a key in ``secret.json``, checked with ``check_url`` (optional)
+agent, and the site counts as logged in while the body contains ``marker``. Stored cookies carry no
+expiry: the web view caps them (WebKit: seven days) while the server session lives on, so only the
+marker decides. Skills read the jar through ``cookie_file``. ``api_key``: a key in ``secret.json``, checked with ``check_url`` (optional)
 without following redirects. ``oauth``: authorization code + PKCE, tokens in ``secret.json``,
 handled by ``site_oauth``. ``keepalive`` checks due sites every six hours and publishes one notice
 when a login expired.
@@ -83,7 +84,13 @@ def _write(path: Path, data: bytes) -> None:
         raise
 
 
+def _no_expiry(jar: MozillaCookieJar) -> None:
+    for c in jar:
+        c.expires, c.discard = None, True
+
+
 def _write_jar(jar: MozillaCookieJar, path: Path) -> None:
+    _no_expiry(jar)
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
     os.close(os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
     try:
@@ -610,6 +617,7 @@ def _check_cookie(site_id: str, meta: dict) -> dict:
     outcome, detail = "error", None
     try:
         jar.load(str(cookies), ignore_discard=True, ignore_expires=True)
+        _no_expiry(jar)
         body = _fetch(meta["check_url"], meta.get("user_agent") or "Mozilla/5.0", jar)
         outcome = "ok" if meta["marker"].encode("utf-8") in body else "miss"
     except HTTPError as e:

@@ -2,7 +2,7 @@ manifest_version: 2
 name: hermes_app
 label: Hermes App
 kind: platform
-version: 2.7.0
+version: 2.7.1
 description: >
   Server side of the Hermes iOS app. Stores gateway and cron notices, serves them with
   upload, search, stats, file (artefact), share action, todo, run activity, message, voice (speech-to-text and text-to-speech through Hermes's
