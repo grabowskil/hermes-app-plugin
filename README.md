@@ -27,7 +27,7 @@ hermes gateway restart
 All routes live on the API server's own port (default 8642) and need the same
 `Authorization: Bearer $API_SERVER_KEY` as the rest of the API server. Without it they return `401`.
 
-- `GET /app/v1/capabilities`: `{"plugin": "hermes_app", "version": "2.7.0", "min_app": "1.0", "features": ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers", "stats", "files", "share_actions"]}`, plus `voice_stt` and/or `voice_tts` when the Hermes side can serve them (see Voice). `min_app` is the oldest client contract level the plugin serves (the app's `AppInfo.clientVersion`, not its App Store version). The app calls this first; a `404` means the plugin is not installed and the app hides the features above.
+- `GET /app/v1/capabilities`: `{"plugin": "hermes_app", "version": "2.8.0", "min_app": "1.0", "features": ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers", "stats", "files", "share_actions"]}`, plus `voice_stt` and/or `voice_tts` when the Hermes side can serve them (see Voice). `min_app` is the oldest client contract level the plugin serves (the app's `AppInfo.clientVersion`, not its App Store version). The app calls this first; a `404` means the plugin is not installed and the app hides the features above.
 - `GET /app/v1/sites/providers`: `{"providers": [{"id", "name", "kind", "help", "flows", "fields"}]}`, the OAuth providers the host knows (`google`, `ebay`); `fields[]` is `{key, label, secret?, required?, default?}`. The server-only endpoints and switches are never served. Announced by the `site_providers` feature.
 - `POST /app/v1/sites`: add or update a site. For OAuth, `provider` (`google`, `ebay`) fills the endpoints and defaults; `preset: "google"` is the old name and stays an alias. With a provider only its `fields` keys (`client_id`, `client_secret`, `scopes`, `redirect_uri`, `redirect_param`) are read from the body. A site with `redirect_param` (eBay RuName) signs in with Safari only; host login answers `400 {"error": "sign in with Safari for this site"}`.
 - `GET /app/v1/notices?limit=100`: `{"notices": [...]}`, newest first.
@@ -123,7 +123,8 @@ The key is the API server key, read through Hermes's secret routes. Treat the co
 What a user should know before installing (Hermes catalog rule 13):
 
 - Serves the routes above on the API server's port. It opens no listener of its own.
-- Reads `~/.hermes/state.db` read-only for search.
+- Reads `~/.hermes/state.db` for search. Writes one ended `cron` session to it for each delivery of a
+  `no_agent` cron job (the script's output as the reply), so the run can be answered in the app.
 - Writes uploads to `~/.hermes/uploads/`. Voice requests write audio to the system temp folder for the length of one request.
 - Stores notices and device tokens in `~/.hermes/hermes_app/` (`notices.jsonl`, `devices.json`, `widget_devices.json`; override the folder with `HERMES_APP_DATA_DIR`).
 - Keeps the agent's todo lists in memory.
@@ -143,6 +144,7 @@ What a user should know before installing (Hermes catalog rule 13):
 - `sites.py`, `site_oauth.py`, `site_providers.py`: site logins, the OAuth flow, the provider table.
 - `pair.py`: `hermes app pair`.
 - `store.py`: notice classifier, JSONL notice store, device lists.
+- `cron_sessions.py`: a chat session for each `no_agent` cron delivery.
 - `upload.py`, `search.py`, `todos.py`: upload storage, search query, todo list hook.
 - `stats.py`, `files.py`, `share.py`: usage counters, artefact path check, share actions file.
 - `voice.py`: speech-to-text and text-to-speech through Hermes's tools, feature check.

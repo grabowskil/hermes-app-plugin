@@ -211,7 +211,7 @@ def test_capabilities(fake_browser, monkeypatch):
 
     base = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers",
             "stats", "files", "share_actions"]
-    expect = {"plugin": "hermes_app", "version": "2.7.0", "min_app": "1.0"}
+    expect = {"plugin": "hermes_app", "version": "2.8.0", "min_app": "1.0"}
     assert _run(go) == (200, {**expect, "features": base + ["host_login"]})
     fake_browser.is_available = False
     assert _run(go) == (200, {**expect, "features": base})

@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
-from . import activity, budget, pair, profiles, routes, store, todos
+from . import activity, budget, cron_sessions, pair, profiles, routes, store, todos
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +40,10 @@ def publish(notice: dict) -> None:
 
 
 def _deliver(content: str) -> dict:
-    """classify -> publish."""
+    """classify -> publish -> a session for a no_agent cron run."""
     notice = store.classify(content)
     publish(notice)
+    cron_sessions.record(notice)
     return notice
 
 
