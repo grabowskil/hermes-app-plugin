@@ -84,7 +84,7 @@ def test_cookies_roundtrip(tmp_path, monkeypatch):
     jar.load(str(sites.stored_cookie_path("yt")), ignore_discard=True, ignore_expires=True)
     got = {c.name: c for c in jar}
     assert set(got) == {"dom", "host", "sess"}
-    assert got["dom"].domain == ".example.com" and got["dom"].secure and got["dom"].expires == 4102444800
+    assert got["dom"].domain == ".example.com" and got["dom"].secure and got["dom"].expires is None
     assert got["host"].domain == "www.example.com" and not got["host"].domain_specified
     assert got["sess"].expires is None and got["sess"].discard
     assert got["host"].value == "b"
@@ -142,6 +142,14 @@ def test_rotated_cookie_saved_on_ok(env):
     assert sites.check("yt")["status"] == "ok"
     assert b"rotated-value" in env.cookies_txt()
     assert SECRET.encode() not in env.cookies_txt()
+
+
+def test_check_sends_cookies_past_their_stored_expiry(env):
+    """The web view caps cookie lifetimes (WebKit: 7 days); the server's marker decides."""
+    env.add()
+    sites.save_session("yt", [cookie("sid", expires=1000)], UA)
+    assert sites.check("yt")["status"] == "ok"
+    assert SECRET in env.state["seen"][-1]["cookie"]
 
 
 def test_check_without_session_is_missing_and_no_request(env):
