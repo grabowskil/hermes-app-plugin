@@ -19,15 +19,15 @@ from aiohttp import web
 
 import json
 
-from . import activity, budget, files, host_browser, profiles, search, share, site_oauth, site_providers, sites, stats, store, todos, transcript, upload, voice
+from . import activity, budget, files, host_browser, model_options, profiles, search, share, site_oauth, site_providers, sites, stats, store, todos, transcript, upload, voice
 
 logger = logging.getLogger(__name__)
 
 PLUGIN = "hermes_app"
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 MIN_APP = "1.0"  # oldest app build this plugin still serves
 FEATURES = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers", "stats", "files",
-            "share_actions"]
+            "share_actions", "model_options"]
 PREFIX = "/app/v1"
 KEEPALIVE_KEY = web.AppKey("hermes_app_sites_keepalive", asyncio.Task)  # the keepalive task
 WIRED_KEY = web.AppKey("hermes_app_wired", bool)  # once-per-app guard
@@ -174,6 +174,16 @@ async def get_file(request: web.Request) -> web.Response:
 
 async def get_share_actions(request: web.Request) -> web.Response:
     return web.json_response(await asyncio.to_thread(share.load))
+
+
+async def get_model_options(request: web.Request) -> web.Response:
+    session_id = request.query.get("session_id", "").strip() or None
+    try:
+        payload = await asyncio.to_thread(model_options.build, session_id)
+    except Exception:
+        logger.exception("hermes_app: model options failed")
+        return web.json_response({"error": "model options failed"}, status=500)
+    return web.json_response(payload)
 
 
 async def get_todos(request: web.Request) -> web.Response:
@@ -525,6 +535,7 @@ def wire(app: web.Application, adapter) -> None:
         ("POST", "/voice/transcribe", voice_transcribe),
         ("POST", "/voice/speak", voice_speak),
         ("GET", "/todos", get_todos),
+        ("GET", "/model/options", get_model_options),
         ("GET", "/sessions/{id}/activity", get_activity),
         ("GET", "/sessions/{id}/messages", get_messages),
         ("PUT", "/sessions/{id}/mode", put_mode),
