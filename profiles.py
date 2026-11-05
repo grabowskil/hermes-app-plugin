@@ -350,14 +350,17 @@ def build_middleware(
         if not session_id:
             return {"request": request}
         state = store.get(session_id)
-        if not state.enabled or not state.profile_ids:
+        if not state.enabled:
             return {"request": request}
         catalog = catalog_provider()
         if not catalog.available:
             return {"request": request}
-        # Filter to known profile ids only.
+        # Filter to known profile ids only; when the selection is empty, fall
+        # back to the profiles the catalog marks default-on.
         known = {p.id for p in catalog.profiles}
-        ids = [pid for pid in state.profile_ids if pid in known]
+        ids = [pid for pid in (state.profile_ids or []) if pid in known]
+        if not ids:
+            ids = [p.id for p in catalog.profiles if p.default_on]
         if not ids:
             return {"request": request}
         payload = assemble_payload(catalog, ids)
