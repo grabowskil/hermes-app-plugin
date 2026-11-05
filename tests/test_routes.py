@@ -7,7 +7,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from hermes_app import adapter, routes, store, todos
+from hermes_app import adapter, profiles, routes, store, todos
 
 KEY = "k" * 32
 AUTH = {"Authorization": f"Bearer {KEY}"}
@@ -211,7 +211,7 @@ def test_capabilities(fake_browser, monkeypatch):
 
     base = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers",
             "stats", "files", "share_actions", "model_options"]
-    expect = {"plugin": "hermes_app", "version": "2.9.0", "min_app": "1.0"}
+    expect = {"plugin": "hermes_app", "version": "2.10.0", "min_app": "1.0"}
     assert _run(go) == (200, {**expect, "features": base + ["host_login"]})
     fake_browser.is_available = False
     assert _run(go) == (200, {**expect, "features": base})
@@ -539,3 +539,10 @@ def test_cleanup_closes_host_browser(fake_browser):
 
     asyncio.run(main())
     assert fake_browser.closed == ["*"]
+
+
+def test_session_store_lists_only_enabled_ids(tmp_path):
+    sessions = profiles.SessionStore(tmp_path / "session_modes.json")
+    sessions.set("on", profiles.SessionState(enabled=True, profile_ids=["a"]))
+    sessions.set("off", profiles.SessionState(enabled=False, profile_ids=["a"]))
+    assert sessions.enabled_ids() == ["on"]

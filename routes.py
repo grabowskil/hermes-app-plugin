@@ -24,7 +24,7 @@ from . import activity, budget, files, host_browser, model_options, profiles, se
 logger = logging.getLogger(__name__)
 
 PLUGIN = "hermes_app"
-VERSION = "2.9.0"
+VERSION = "2.10.0"
 MIN_APP = "1.0"  # oldest app build this plugin still serves
 FEATURES = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers", "stats", "files",
             "share_actions", "model_options"]
@@ -490,6 +490,15 @@ async def profiles_catalog(_request: web.Request) -> web.Response:
     return web.json_response(profiles.catalog_to_dict(cat))
 
 
+async def profiles_sessions(_request: web.Request) -> web.Response:
+    cat = profiles.discover_catalog()
+    if not cat.available:
+        return web.json_response({"label": None, "session_ids": []})
+    return web.json_response(
+        {"label": cat.label, "session_ids": profiles.get_store().enabled_ids()}
+    )
+
+
 async def session_profile_get(request: web.Request) -> web.Response:
     session_id = request.match_info["id"]
     state = profiles.get_store().get(session_id)
@@ -551,6 +560,7 @@ def wire(app: web.Application, adapter) -> None:
         ("POST", "/sites/{id}/host-login", host_login),
         ("POST", "/sites/{id}/host-login/finish", host_login_finish),
         ("GET", "/profiles", profiles_catalog),
+        ("GET", "/profiles/sessions", profiles_sessions),
         ("GET", "/sessions/{id}/profile", session_profile_get),
         ("PUT", "/sessions/{id}/profile", session_profile_put),
     ):

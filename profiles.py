@@ -309,6 +309,10 @@ class SessionStore:
         ids = [str(x) for x in ids_raw] if isinstance(ids_raw, list) else None
         return SessionState(enabled=bool(entry.get("enabled", False)), profile_ids=ids)
 
+    def enabled_ids(self) -> list[str]:
+        self._ensure_loaded()
+        return [sid for sid, entry in self._data.items() if entry.get("enabled") is True]
+
     def set(self, session_id: str, state: SessionState) -> None:
         self._ensure_loaded()
         with self._lock:
