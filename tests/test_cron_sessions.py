@@ -26,6 +26,11 @@ class FakeDB:
     def end_session(self, session_id, reason):
         self.sessions[session_id]["end_reason"] = reason
 
+    def _write_sql(self, sql, params):
+        source, session_id = params
+        if self.sessions.get(session_id, {}).get("source") == "cron":
+            self.sessions[session_id]["source"] = source
+
 
 def _setup(monkeypatch):
     db = FakeDB()
@@ -56,3 +61,12 @@ def test_agent_jobs_and_gateway_notices_are_skipped(monkeypatch):
     assert cron_sessions.record(_notice("missing")) is None
     assert cron_sessions.record({"kind": "gateway", "body": "Gateway online"}) is None
     assert db.sessions == {}
+
+
+def test_reply_in_the_app_makes_a_cron_session_yours(monkeypatch):
+    db = _setup(monkeypatch)
+    session_id = cron_sessions.record(_notice("nojob1"))
+    cron_sessions.on_pre_llm_call(session_id=session_id, platform="cron")
+    assert db.sessions[session_id]["source"] == "cron"
+    cron_sessions.on_pre_llm_call(session_id=session_id, platform="api_server")
+    assert db.sessions[session_id]["source"] == "api_server"

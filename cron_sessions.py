@@ -4,7 +4,7 @@ A ``no_agent`` job runs its script and delivers stdout; the gateway opens no ses
 only shows up as a notice and cannot be answered. When such a delivery reaches this adapter, the run is
 written into ``state.db`` the way the scheduler writes an agent cron run: a ``cron`` session titled
 ``<job name> · <Mon DD HH:MM>``, the job as the user turn and the output as the reply. The app lists it
-under CRON, and a reply there continues it like any other session.
+under CRON, and a reply there continues it like any other session and makes it yours (``on_pre_llm_call``).
 """
 import logging
 
@@ -56,3 +56,25 @@ def _write(job: dict, output: str) -> str:
     finally:
         release_or_close(db)
     return session_id
+
+
+def on_pre_llm_call(**kwargs) -> None:
+    """A turn you start in a cron session makes it yours: ``source`` becomes the replying platform.
+
+    The gateway keeps the first ``source`` on later upserts, so a reply over ``/v1/runs`` would leave it
+    ``cron``. Hermes keeps the provenance in ``created_source``; ``source`` is live state. The scheduler's
+    own runs report ``platform="cron"`` and are skipped. Never raises.
+    """
+    session_id, platform = kwargs.get("session_id"), kwargs.get("platform")
+    if not session_id or not isinstance(platform, str) or platform in ("", "cron"):
+        return
+    try:
+        from hermes_state_registry import acquire, release_or_close
+
+        db = acquire()
+        try:
+            db._write_sql("UPDATE sessions SET source = ? WHERE id = ? AND source = 'cron'", (platform, session_id))
+        finally:
+            release_or_close(db)
+    except Exception:
+        logger.exception("hermes_app: cron session %s not adopted", session_id)

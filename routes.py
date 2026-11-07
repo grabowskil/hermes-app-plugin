@@ -24,7 +24,7 @@ from . import activity, budget, files, host_browser, model_options, profiles, se
 logger = logging.getLogger(__name__)
 
 PLUGIN = "hermes_app"
-VERSION = "2.10.0"
+VERSION = "2.11.0"
 MIN_APP = "1.0"  # oldest app build this plugin still serves
 FEATURES = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers", "stats", "files",
             "share_actions", "model_options"]

@@ -120,6 +120,7 @@ def register(ctx) -> None:
     ctx.register_hook("post_tool_call", todos.on_post_tool_call)
     for hook, callback in (
         ("pre_llm_call", activity.on_pre_llm_call),
+        ("pre_llm_call", cron_sessions.on_pre_llm_call),
         ("pre_api_request", activity.on_pre_api_request),
         ("post_api_request", activity.on_post_api_request),
         ("post_tool_call", activity.on_post_tool_call),
