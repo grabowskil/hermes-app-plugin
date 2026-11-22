@@ -46,6 +46,30 @@ All routes live on the API server's own port (default 8642) and need the same
 - `PUT /app/v1/sessions/{id}/mode` with `{"mode": "quick"|"deep"|"unlimited"}`: returns `{"mode"}`, `400` for any other value. Kept in memory; the default is `quick`.
 - `GET /app/v1/profiles/sessions`: `{"label", "session_ids": [...]}`, the sessions whose response-profile loadout is enabled, with the catalog label. `{"label": null, "session_ids": []}` when no profile catalog is installed.
 
+## Agent sessions (Claude Code)
+
+Under `/app/v1/agents` (feature `agents`) the plugin lists, follows, continues and starts local agent sessions of other
+tools on the host. Stage 1 provider: `claude_code` (needs the `claude` CLI; runs use its subscription login, so API-key
+variables are removed from the child process). Sessions held by another process (for example a Remote Control
+session) are read-only: a run is refused with `409 {"error":"live_elsewhere","open_url"}`; fork the session instead.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /agents` | Providers with models, efforts, permission modes, capabilities and defaults. |
+| `GET /agents/{p}/environments` | Host folders a session can start in. |
+| `GET /agents/{p}/sessions?limit=` | Sessions (`live`, `busy`, `open_url`, `options`). |
+| `POST /agents/{p}/sessions` | `{environment_id, options}`: a draft session; nothing runs until the first message. |
+| `GET` / `PATCH /agents/{p}/sessions/{id}` | Read a session, or set `{options}` for the next runs. |
+| `POST /agents/{p}/sessions/{id}/fork` | A draft that forks the session on its first run. |
+| `GET /agents/{p}/sessions/{id}/messages` | `?limit=&offset=` or `?after_id=&limit=` (returns `last_id`). |
+| `GET /agents/{p}/sessions/{id}/activity` | Run activity (`run_id` when the plugin runs it). |
+| `POST /agents/{p}/sessions/{id}/runs` | `{input}` returns `{run_id, session_id}`. `409` when live elsewhere or already running. |
+| `GET /agents/{p}/runs/{run}/events` | SSE run events (`message.delta`, `tool.started`, `tool.completed`, `run.completed`, `run.failed`, `run.cancelled`). |
+| `GET /agents/{p}/runs/{run}` | `{status, output}`. |
+| `POST /agents/{p}/runs/{run}/stop` | Interrupt the run. |
+
+Shapes: `docs/contract/agents-*.json` and `agents-run-events.sse`.
+
 ## Share actions
 
 Optional `<HERMES_HOME>/hermes_app/share_actions.yaml`; without it the chooser has no host actions and the app

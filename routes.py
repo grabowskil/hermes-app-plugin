@@ -19,15 +19,16 @@ from aiohttp import web
 
 import json
 
+from .agents import routes as agents_routes
 from . import activity, board, budget, files, host_browser, model_options, profiles, search, share, site_oauth, site_providers, sites, stats, store, todos, transcript, upload, voice
 
 logger = logging.getLogger(__name__)
 
 PLUGIN = "hermes_app"
-VERSION = "2.12.0"
+VERSION = "2.13.0"
 MIN_APP = "1.0"  # oldest app build this plugin still serves
 FEATURES = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers", "stats", "files",
-            "share_actions", "model_options", "board"]
+            "share_actions", "model_options", "board", "agents"]
 PREFIX = "/app/v1"
 KEEPALIVE_KEY = web.AppKey("hermes_app_sites_keepalive", asyncio.Task)  # the keepalive task
 WIRED_KEY = web.AppKey("hermes_app_wired", bool)  # once-per-app guard
@@ -570,6 +571,7 @@ def wire(app: web.Application, adapter) -> None:
         ("PUT", "/sessions/{id}/profile", session_profile_put),
     ):
         app.router.add_route(method, PREFIX + path, _authed(adapter, handler))
+    agents_routes.wire(app, lambda h: _authed(adapter, h), PREFIX)
     if WIRED_KEY not in app:
         app[WIRED_KEY] = True
         start, stop = _start_keepalive(publish)
