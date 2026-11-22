@@ -8,12 +8,13 @@ Outbound only. The gateway's shutdown/online notices and cron deliveries arrive 
 """
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
-from . import activity, budget, cron_sessions, pair, profiles, routes, store, todos
+from . import activity, board, budget, cron_sessions, pair, profiles, routes, store, todos
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +41,19 @@ def publish(notice: dict) -> None:
 
 
 def _deliver(content: str) -> dict:
-    """classify -> publish -> a session for a no_agent cron run."""
+    """classify -> session of the run -> publish. ``session_id`` is the chat the notice opens."""
     notice = store.classify(content)
+    notice["session_id"] = None
+    if notice["kind"] == "cron" and notice["job_id"]:
+        notice["session_id"] = cron_sessions.record(notice)  # no_agent run: written now
+        if notice["session_id"] is None:  # agent run: the scheduler already stored its session
+            con = cron_sessions.connect()
+            try:
+                notice["session_id"] = cron_sessions.newest_session(con, notice["job_id"])
+            finally:
+                if con is not None:
+                    con.close()
     publish(notice)
-    cron_sessions.record(notice)
     return notice
 
 
@@ -116,6 +126,19 @@ def register(ctx) -> None:
         # Keep cron output in one notice; the app shows the full text.
         max_message_length=1_000_000,
         emoji="📱",
+    )
+    ctx.register_tool(
+        name=board.TOOL,
+        toolset="hermes_app",
+        schema=board.SCHEMA,
+        handler=board.handle_publish,
+        description=board.SCHEMA["description"],
+        emoji="📋",
+    )
+    ctx.register_skill(
+        name="board",
+        path=Path(__file__).parent / "skills" / "board" / "SKILL.md",
+        description="Compose the app's Playground board with app_board_publish.",
     )
     ctx.register_hook("post_tool_call", todos.on_post_tool_call)
     for hook, callback in (

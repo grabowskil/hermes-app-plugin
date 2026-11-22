@@ -1,5 +1,6 @@
 
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timedelta
 
 
 from hermes_app import store
@@ -61,3 +62,21 @@ def test_devices(monkeypatch, tmp_path):
     ]
     store.remove_devices(["aa"])
     assert store.load_devices() == [{"token": "bb", "environment": "sandbox"}]
+
+
+def test_cron_notice_session_backfill(monkeypatch, tmp_path):
+    _use_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    con = sqlite3.connect(tmp_path / "state.db")
+    con.execute("CREATE TABLE sessions (id TEXT, started_at REAL)")
+    notice = store.classify(CRON_TEXT)
+    t = datetime.fromisoformat(notice["created_at"])
+    for sid, dt in (("cron_a1b2c3d4_old", -3600), ("cron_a1b2c3d4_new", -30), ("cron_a1b2c3d4_later", 3600),
+                    ("cron_other_x", -10)):
+        con.execute("INSERT INTO sessions VALUES (?, ?)", (sid, (t + timedelta(seconds=dt)).timestamp()))
+    con.commit()
+    con.close()
+    store.append(notice)
+    store.append(store.classify(GATEWAY_TEXT))
+    got = {n["kind"]: n["session_id"] for n in store.latest()}
+    assert got == {"cron": "cron_a1b2c3d4_new", "gateway": None}

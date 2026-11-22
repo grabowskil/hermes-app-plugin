@@ -3,7 +3,7 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 CRON_PREFIX = "Cronjob Response: "
@@ -74,7 +74,30 @@ def latest(limit: int = 100) -> list[dict]:
             continue
         if isinstance(obj, dict):
             out.append(obj)
+    _fill_sessions(out)
     return out
+
+
+def _fill_sessions(notices: list[dict]) -> None:
+    """Older cron notices lack ``session_id``: find the run's session (started by notice time + 2 min)."""
+    missing = [n for n in notices if "session_id" not in n]
+    if not missing:
+        return
+    from . import cron_sessions
+
+    con = cron_sessions.connect()
+    try:
+        for n in missing:
+            n["session_id"] = None
+            if n.get("kind") == "cron" and n.get("job_id"):
+                try:
+                    until = (datetime.fromisoformat(n["created_at"]) + timedelta(seconds=120)).isoformat()
+                except (KeyError, TypeError, ValueError):
+                    continue
+                n["session_id"] = cron_sessions.newest_session(con, n["job_id"], until)
+    finally:
+        if con is not None:
+            con.close()
 
 
 def _devices_path(kind: str = "alert") -> Path:

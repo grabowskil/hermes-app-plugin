@@ -7,6 +7,8 @@ written into ``state.db`` the way the scheduler writes an agent cron run: a ``cr
 under CRON, and a reply there continues it like any other session and makes it yours (``on_pre_llm_call``).
 """
 import logging
+import sqlite3
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,34 @@ def record(notice: dict) -> str | None:
     except Exception:
         logger.exception("hermes_app: no session for cron job %s", job_id)
         return None
+
+
+def connect() -> sqlite3.Connection | None:
+    """Read-only connection to ``state.db``, or None. Never raises."""
+    from .files import _hermes_home
+
+    try:
+        return sqlite3.connect(f"file:{_hermes_home() / 'state.db'}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+
+
+def newest_session(con: sqlite3.Connection | None, job_id: str, until: str | None = None) -> str | None:
+    """Newest ``cron_<job_id>_*`` session id; with ISO time ``until``, one started in the 3 h before it
+    (a run is not older than that, and an older notice must not borrow an earlier run). Never raises."""
+    if con is None or not job_id:
+        return None
+    prefix = f"cron_{job_id}_"
+    sql, args = "SELECT id FROM sessions WHERE substr(id, 1, ?) = ?", [len(prefix), prefix]
+    try:
+        if until:
+            end = datetime.fromisoformat(until).timestamp()
+            sql += " AND started_at BETWEEN ? AND ?"
+            args += [end - 3 * 3600, end]
+        row = con.execute(sql + " ORDER BY started_at DESC LIMIT 1", args).fetchone()
+    except (sqlite3.Error, ValueError):
+        return None
+    return row[0] if row else None
 
 
 def _write(job: dict, output: str) -> str:

@@ -19,15 +19,15 @@ from aiohttp import web
 
 import json
 
-from . import activity, budget, files, host_browser, model_options, profiles, search, share, site_oauth, site_providers, sites, stats, store, todos, transcript, upload, voice
+from . import activity, board, budget, files, host_browser, model_options, profiles, search, share, site_oauth, site_providers, sites, stats, store, todos, transcript, upload, voice
 
 logger = logging.getLogger(__name__)
 
 PLUGIN = "hermes_app"
-VERSION = "2.11.0"
+VERSION = "2.12.0"
 MIN_APP = "1.0"  # oldest app build this plugin still serves
 FEATURES = ["notices", "devices", "upload", "search", "todos", "sites", "site_manage", "activity", "site_providers", "stats", "files",
-            "share_actions", "model_options"]
+            "share_actions", "model_options", "board"]
 PREFIX = "/app/v1"
 KEEPALIVE_KEY = web.AppKey("hermes_app_sites_keepalive", asyncio.Task)  # the keepalive task
 WIRED_KEY = web.AppKey("hermes_app_wired", bool)  # once-per-app guard
@@ -72,6 +72,10 @@ async def notices(request: web.Request) -> web.Response:
     except ValueError:
         limit = 100
     return web.json_response({"notices": store.latest(limit)})
+
+
+async def get_board(request: web.Request) -> web.Response:
+    return web.json_response({"board": board.read()})
 
 
 async def devices(request: web.Request) -> web.Response:
@@ -535,6 +539,7 @@ def wire(app: web.Application, adapter) -> None:
     for method, path, handler in (
         ("GET", "/capabilities", capabilities),
         ("GET", "/notices", notices),
+        ("GET", "/board", get_board),
         ("POST", "/devices", devices),
         ("POST", "/upload", upload_file),
         ("GET", "/search", search_messages),
